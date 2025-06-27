@@ -1,0 +1,30 @@
+{
+    "configurations": [
+      {
+        "name": "GCC 12.2",
+        "compilerPath": "/usr/bin/g++",
+        "cStandard": "c17",
+        "cppStandard": "c++17",
+        "intelliSenseMode": "linux-gcc-arm64",
+        "includePath": [
+          "/usr/include",
+          "/usr/include/c++/12",
+          "/usr/include/arm-linux-gnueabihf",
+          "/usr/include/c++/12/backward",
+          "/usr/include/opencv4",
+          "/usr/include/libcamera"
+        ],
+        "browse": {
+          "path": [
+            "/usr/include",
+            "/usr/include/c++/12",
+            "/usr/include/opencv4",
+            "/usr/include/libcamera"
+          ],
+          "limitSymbolsToIncludedHeaders": true
+        }
+      }
+    ],
+    "version": 4
+  }
+  
