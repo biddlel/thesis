@@ -10,6 +10,7 @@ const int NUM_BLOCKS_TO_COLLECT = FFT_SIZE / AUDIO_BLOCK_SAMPLES;
 const float SOUND_SPEED = 343000.0; // in mm/s
 
 // --- Microphone Array Setup ---
+// TODO
 const int NUM_MICS = 4;
 struct MicCoordinate { float x, y, z; };
 MicCoordinate mic_coords[NUM_MICS] = {
