@@ -14,10 +14,10 @@ const float SOUND_SPEED = 343000.0; // in mm/s
 const int NUM_MICS = 4;
 struct MicCoordinate { float x, y, z; };
 MicCoordinate mic_coords[NUM_MICS] = {
-  {-25.0, -25.0, 0.0}, // Mic 1 (bottom-left)
-  { 25.0, -25.0, 0.0}, // Mic 2 (bottom-right)
-  {-25.0,  25.0, 0.0}, // Mic 3 (top-left)
-  { 25.0,  25.0, 0.0}  // Mic 4 (top-right)
+  {-25.0, -25.0, 0.0}, // Mic 1 (top-right)
+  { 25.0, -25.0, 0.0}, // Mic 2 (top-left)
+  {-25.0,  25.0, 0.0}, // Mic 3 (bottom-left)
+  { 25.0,  25.0, 0.0}  // Mic 4 (bottom-right)
 };
 
 // --- MUSIC Algorithm Parameters ---
@@ -37,7 +37,6 @@ const int   GRID_Y_STEPS = 20;       // Number of steps in Y direction
 // --- Audio System Setup ---
 AudioInputI2SQuad    i2s_quad;
 AudioQueue           queues[NUM_MICS];
-AudioControlSGTL5000 sgtl5000;
 AudioConnection*     patchCords[NUM_MICS];
 
 // --- Buffers and Variables ---
@@ -51,9 +50,7 @@ void setup() {
   Serial.begin(9600);
   while (!Serial && millis() < 4000) {}
 
-  AudioMemory(80);
-  sgtl5000.enable();
-  sgtl5000.volume(0.5);
+  AudioMemory(120);
 
   for(int i=0; i<NUM_MICS; ++i) {
     patchCords[i] = new AudioConnection(i2s_quad, i, queues[i], 0);
