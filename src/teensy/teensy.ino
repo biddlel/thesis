@@ -1,11 +1,11 @@
 #include <Audio.h>
 #include <arm_math.h>
 #include "linalg.h"
+#include "AudioFilterSPH0645.h"
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
 const int FFT_SIZE = 256;
-const int AUDIO_BLOCK_SAMPLES = AUDIO_BLOCK_SAMPLES;
 const int NUM_BLOCKS_TO_COLLECT = FFT_SIZE / AUDIO_BLOCK_SAMPLES;
 const float SOUND_SPEED = 343000.0; // in mm/s
 
@@ -29,70 +29,110 @@ const int END_FREQ_BIN = 40;      // Freq bin to end analysis
 const float TARGET_PLANE_Z = -500.0; // Z-height of the plane to search (mm)
 const float GRID_X_MIN = -1000.0;    // Search area min X (mm)
 const float GRID_X_MAX =  1000.0;    // Search area max X (mm)
-const int   GRID_X_STEPS = 20;       // Number of steps in X direction
+const int   GRID_X_STEPS = 100;       // Number of steps in X direction
 const float GRID_Y_MIN = -1000.0;    // Search area min Y (mm)
 const float GRID_Y_MAX =  1000.0;    // Search area max Y (mm)
-const int   GRID_Y_STEPS = 20;       // Number of steps in Y direction
+const int   GRID_Y_STEPS = 100;       // Number of steps in Y direction
 
 // --- Audio System Setup ---
 AudioInputI2SQuad    i2s_quad;
-AudioQueue           queues[NUM_MICS];
+AudioFilterSPH0645   mic_correction[NUM_MICS];
+AudioRecordQueue     queues[NUM_MICS];
 AudioConnection*     patchCords[NUM_MICS];
+AudioConnection*     correctionConnection[NUM_MICS];
 
 // --- Buffers and Variables ---
 int16_t mic_buffers[NUM_MICS][FFT_SIZE];
 int blocks_collected = 0;
-float32_t fft_outputs[NUM_MICS][FFT_SIZE * 2];
-arm_cfft_instance_f32 fft_inst;
+float32_t fft_inputs[NUM_MICS][FFT_SIZE];
+float32_t fft_outputs[NUM_MICS][FFT_SIZE];  // Only need N/2+1 complex numbers for real FFT
+arm_rfft_fast_instance_f32 fft_inst;
 float music_spectrum[GRID_X_STEPS][GRID_Y_STEPS];
 
 void setup() {
   Serial.begin(9600);
   while (!Serial && millis() < 4000) {}
 
+  // Start the audio queues
   AudioMemory(120);
-
+  // Serial.print("Audio memory allocated: ");
+  // Serial.println(AudioMemoryUsageMax());
+  
   for(int i=0; i<NUM_MICS; ++i) {
-    patchCords[i] = new AudioConnection(i2s_quad, i, queues[i], 0);
+    correctionConnection[i] = new AudioConnection(i2s_quad, i, mic_correction[i], 0);
+    patchCords[i] = new AudioConnection(mic_correction[i], 0, queues[i], 0);
+    queues[i].begin();
+    // Serial.print("Started queue for mic ");
+    // Serial.println(i);
   }
-
-  arm_cfft_init_f32(&fft_inst, FFT_SIZE);
-  Serial.println("Setup complete. Starting MUSIC coordinate search...");
+  arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+  // Serial.println("Setup complete. Starting MUSIC coordinate search...");
+  delay(1000); // Give some time for serial to initialize
 }
 
 void loop() {
   bool all_queues_ready = true;
+  // static unsigned long last_print = 0;
+  // if (millis() - last_print > 1000) {
+  //   last_print = millis();
+  //   Serial.print("Queue status: ");
+  //   for(int i=0; i<NUM_MICS; ++i) {
+  //     Serial.print("[");
+  //     Serial.print(queues[i].available());
+  //     Serial.print("] ");
+  //   }
+  //   Serial.println();
+  // }
+  
   for(int i=0; i<NUM_MICS; ++i) {
     if(queues[i].available() == 0) { all_queues_ready = false; break; }
   }
 
   if (all_queues_ready) {
+    // Serial.println("All queues ready, collecting blocks...");
+    // Serial.print("Blocks collected: ");
+    // Serial.println(blocks_collected);
     for(int i=0; i<NUM_MICS; ++i) {
-      audio_block_t *block = queues[i].readBuffer();
-      memcpy(mic_buffers[i] + (blocks_collected * AUDIO_BLOCK_SAMPLES), block->data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
-      queues[i].freeBuffer();
+      int16_t *data = queues[i].readBuffer();
+      if (data) {  // Check if data is valid
+        memcpy(mic_buffers[i] + (blocks_collected * AUDIO_BLOCK_SAMPLES), data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
+        queues[i].freeBuffer();
+        // Serial.print("  Mic ");
+        // Serial.print(i);
+        // Serial.println(" data copied");
+      } else {
+        // Serial.print("  No data from mic ");
+        // Serial.println(i);
+      }
     }
     blocks_collected++;
 
     if (blocks_collected >= NUM_BLOCKS_TO_COLLECT) {
+      // Serial.println("\n--- Starting MUSIC algorithm ---");
       run_music_algorithm();
       blocks_collected = 0;
+      // Serial.println("--- MUSIC algorithm completed ---\n");
     }
   }
 }
 
 void run_music_algorithm() {
+  // Serial.println("1. Starting FFT processing...");
   // 1. Perform FFT on all microphone buffers
   for (int i = 0; i < NUM_MICS; ++i) {
+    // Apply window function and convert to float32
     for (int j = 0; j < FFT_SIZE; ++j) {
-      float32_t window = 0.5 * (1 - arm_cos_f32(2 * PI * j / (FFT_SIZE - 1)));
-      fft_outputs[i][2 * j] = (float32_t)mic_buffers[i][j] * window;
-      fft_outputs[i][2 * j + 1] = 0.0;
+      float32_t window = 0.5f * (1.0f - arm_cos_f32(2 * PI * j / (FFT_SIZE - 1)));
+      fft_inputs[i][j] = (float32_t)mic_buffers[i][j] * window;
     }
-    arm_cfft_f32(&fft_inst, fft_outputs[i], 0, 1);
+    // Perform real FFT
+    arm_rfft_fast_f32(&fft_inst, fft_inputs[i], fft_outputs[i], 0);  // 0 for forward FFT
+    // Serial.print("  FFT completed for mic ");
+    // Serial.println(i);
   }
 
   // 2. Clear the broadband music spectrum
+  // Serial.println("2. Clearing music spectrum...");
   for(int ix=0; ix<GRID_X_STEPS; ++ix) for(int iy=0; iy<GRID_Y_STEPS; ++iy) music_spectrum[ix][iy] = 0.0;
 
   // 3. Iterate over frequency bins to build the broadband spectrum
@@ -148,6 +188,7 @@ void run_music_algorithm() {
   }
 
   // 8. Find the peak in the 2D spectrum
+  // Serial.println("8. Finding peak in spectrum...");
   float max_val = -1.0; int max_ix = -1, max_iy = -1;
   for (int ix = 0; ix < GRID_X_STEPS; ix++) {
     for (int iy = 0; iy < GRID_Y_STEPS; iy++) {
@@ -159,8 +200,22 @@ void run_music_algorithm() {
   }
   
   // 9. Convert peak index back to coordinates
+  // Serial.println("9. Converting peak to coordinates...");
   float est_x = GRID_X_MIN + (float)max_ix * (GRID_X_MAX - GRID_X_MIN) / (GRID_X_STEPS - 1);
   float est_y = GRID_Y_MIN + (float)max_iy * (GRID_Y_MAX - GRID_Y_MIN) / (GRID_Y_STEPS - 1);
+  
+  // Debug: Print some audio samples to verify we're getting data
+  // Serial.println("Sample audio data (first 5 samples from each mic):");
+  // for(int i=0; i<NUM_MICS; ++i) {
+  //   Serial.print("Mic ");
+  //   Serial.print(i);
+  //   Serial.print(": ");
+  //   for(int j=0; j<5; ++j) {
+  //     Serial.print(mic_buffers[i][j]);
+  //     Serial.print(" ");
+  //   }
+  //   Serial.println();
+  // }
 
   Serial.print("Estimated Coords (mm): X=");
   Serial.print(est_x, 1);
