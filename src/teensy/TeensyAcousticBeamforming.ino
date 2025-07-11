@@ -3,7 +3,7 @@
 #include "linalg.h"
 
 // --- Configuration Constants ---
-const float SAMPLE_RATE = AUDIO_SAMPLE_RATE;
+const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
 const int FFT_SIZE = 256;
 const int AUDIO_BLOCK_SAMPLES = AUDIO_BLOCK_SAMPLES;
 const int NUM_BLOCKS_TO_COLLECT = FFT_SIZE / AUDIO_BLOCK_SAMPLES;
