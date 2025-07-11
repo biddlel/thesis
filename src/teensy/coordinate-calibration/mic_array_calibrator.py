@@ -28,10 +28,10 @@ def create_zoomed_view(img, center, zoom=4, window_size=200):
 class MicrophoneArrayCalibrator:
     def __init__(self):
         """Initialize the calibrator"""
-        self.frame_corners = []
-        self.mic_points = []
+        self.frame_corners = []  # Will store 4 points
+        self.mic_points = []     # Will store 4 points
+        self.origin = None       # Will store the origin point
         self.homography = None
-        self.origin = None
         self.transformed_mics = None
 
     def select_points(self, img_path, frame_width_mm, frame_height_mm):
@@ -51,61 +51,119 @@ class MicrophoneArrayCalibrator:
         cv2.namedWindow(zoom_win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(zoom_win, 400, 400)
 
-        # First, select frame corners
-        print("\n=== Frame Corner Selection ===")
-        print("Please select the 4 corners of the frame in order:")
-        print("1. Bottom-left corner")
-        print("2. Bottom-right corner")
-        print("3. Top-right corner")
-        print("4. Top-left corner")
+        # First, select the origin point (first point)
+        print("\n=== Point Selection ===")
+        print("1. First, select the origin point (0,0)")
+        print("2. Then select the 4 frame corners in order:")
+        print("   1. Bottom-left corner (min X, min Y)")
+        print("   2. Bottom-right corner (max X, min Y)")
+        print("   3. Top-right corner (max X, max Y)")
+        print("   4. Top-left corner (min X, max Y)")
+        print("3. Finally, select the 4 microphone positions in the same order:")
+        print("   1. Bottom-left mic (min X, min Y)")
+        print("   2. Bottom-right mic (max X, min Y)")
+        print("   3. Top-right mic (max X, max Y)")
+        print("   4. Top-left mic (min X, max Y)")
         print("\nClick to select each point. Right-click to undo last point.")
         print("Press 'q' when done.")
 
+        def redraw_all_points():
+            nonlocal img_copy
+            # Create a fresh copy of the image
+            img_copy = img.copy()
+            
+            # Draw origin if it exists and is not None
+            if self.origin is not None:
+                ox, oy = int(self.origin[0]), int(self.origin[1])
+                cv2.drawMarker(img_copy, (ox, oy), (0, 255, 0), 
+                             cv2.MARKER_CROSS, 20, 2)
+                cv2.putText(img_copy, "Origin (0,0)", (ox+10, oy-10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Draw frame corners
+            for i, (px, py) in enumerate(self.frame_corners):
+                cv2.circle(img_copy, (px, py), 8, (0, 0, 255), -1)  # Red for frame
+                cv2.putText(img_copy, f"Frame {i+1}", (px+15, py-10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Draw microphone points
+            for i, (px, py) in enumerate(self.mic_points):
+                cv2.circle(img_copy, (px, py), 8, (255, 0, 0), -1)  # Blue for mics
+                cv2.putText(img_copy, f"Mic {i+1}", (px+15, py-10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            
+            # Update the display
+            cv2.imshow('Setup Frame and Mics', img_copy)
+            
+            # Update zoom window if mouse is over the image
+            if 'x' in locals() and 'y' in locals():
+                zoomed = create_zoomed_view(img_copy, (x, y))
+                cv2.imshow(zoom_win, zoomed)
+        
         def setup_click_event(event, x, y, flags, param):
             nonlocal img_copy
             
             # Update zoom window on mouse move
             if event == cv2.EVENT_MOUSEMOVE:
+                redraw_all_points()
                 zoomed = create_zoomed_view(img_copy, (x, y))
                 cv2.imshow(zoom_win, zoomed)
             
             # Handle left click - add point
             if event == cv2.EVENT_LBUTTONDOWN:
-                if len(self.frame_corners) < 4:
-                    # Only add frame corner if we haven't completed them yet
-                    self.frame_corners.append((x, y))
-                    # Draw the point
-                    cv2.circle(img_copy, (x, y), 8, (0, 0, 255), -1)  # Red for frame
-                    cv2.putText(img_copy, f"Frame {len(self.frame_corners)}", 
-                              (x+15, y-10), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (0, 0, 255), 2)
+                if self.origin is None:
+                    # First point is the origin
+                    self.origin = np.array([x, y], dtype=np.float32)
+                    print("\nOrigin set. Now select the 4 frame corners.")
                     
+                elif len(self.frame_corners) < 4:
+                    # Add frame corner
+                    self.frame_corners.append((x, y))
                     # If we just finished frame corners, switch to mic points
                     if len(self.frame_corners) == 4:
-                        print("\n=== Microphone Selection ===")
-                        print("Now select the 4 microphone positions:")
-                        print("1. Bottom-left mic")
-                        print("2. Bottom-right mic")
-                        print("3. Top-left mic")
-                        print("4. Top-right mic")
+                        print("\nNow select the 4 microphone positions.")
                 
-                # Only start adding mic points after all frame corners are selected
-                elif len(self.frame_corners) == 4 and len(self.mic_points) < 4:
+                # Add microphone points after frame corners are done
+                elif len(self.mic_points) < 4:
                     self.mic_points.append((x, y))
-                    # Draw the point
-                    cv2.circle(img_copy, (x, y), 8, (255, 0, 0), -1)  # Blue for mics
-                    cv2.putText(img_copy, f"Mic {len(self.mic_points)}", 
-                              (x+15, y-10), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (255, 0, 0), 2)
+                
+                # Redraw all points
+                redraw_all_points()
             
             # Handle right click - undo last point
             elif event == cv2.EVENT_RBUTTONDOWN:
                 if len(self.mic_points) > 0:
-                    # Undo last mic point if any exist
+                    # Undo last mic point
                     self.mic_points.pop()
                 elif len(self.frame_corners) > 0:
-                    # Otherwise undo last frame corner
+                    # Undo last frame corner
                     self.frame_corners.pop()
+                elif hasattr(self, 'origin'):
+                    # Remove origin if it exists
+                    delattr(self, 'origin')
+                
+                # Redraw all points
+                img_copy = img.copy()
+                
+                # Redraw origin if it exists
+                if hasattr(self, 'origin'):
+                    px, py = int(self.origin[0]), int(self.origin[1])
+                    cv2.drawMarker(img_copy, (px, py), (0, 255, 0), 
+                                 cv2.MARKER_CROSS, 20, 2)
+                    cv2.putText(img_copy, "Origin (0,0)", (px+10, py-10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Redraw frame corners
+                for i, (px, py) in enumerate(self.frame_corners):
+                    cv2.circle(img_copy, (px, py), 8, (0, 0, 255), -1)
+                    cv2.putText(img_copy, f"Frame {i+1}", (px+15, py-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Redraw mic points
+                for i, (px, py) in enumerate(self.mic_points):
+                    cv2.circle(img_copy, (px, py), 8, (255, 0, 0), -1)
+                    cv2.putText(img_copy, f"Mic {i+1}", (px+15, py-10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 
                 # Redraw all points
                 img_copy = img.copy()
@@ -119,10 +177,17 @@ class MicrophoneArrayCalibrator:
                     cv2.circle(img_copy, (px, py), 8, (255, 0, 0), -1)
                     cv2.putText(img_copy, f"Mic {i+1}", (px+15, py-10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                # Redraw origin if it exists
+                if hasattr(self, 'origin'):
+                    px, py = int(self.origin[0]), int(self.origin[1])
+                    cv2.drawMarker(img_copy, (px, py), (0, 255, 0), 
+                                 cv2.MARKER_CROSS, 20, 2)
+                    cv2.putText(img_copy, "Origin (0,0)", (px+10, py-10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Update display
             cv2.imshow('Setup Frame and Mics', img_copy)
-            if len(self.frame_corners) > 0 or len(self.mic_points) > 0:
+            if len(self.frame_corners) > 0 or len(self.mic_points) > 0 or hasattr(self, 'origin'):
                 zoomed = create_zoomed_view(img_copy, (x, y))
                 cv2.imshow(zoom_win, zoomed)
 
@@ -131,18 +196,25 @@ class MicrophoneArrayCalibrator:
         cv2.setMouseCallback('Setup Frame and Mics', setup_click_event)
 
         # Wait for all points to be selected
-        while len(self.frame_corners) < 4 or len(self.mic_points) < 4:
+        while len(self.frame_corners) < 4 or len(self.mic_points) < 4 or not hasattr(self, 'origin'):
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 cv2.destroyAllWindows()
                 return False
 
         # Calculate homography
+        # Define destination points with proper coordinate system:
+        # Define destination points for homography
+        # - X increases to the right
+        # - Y increases upward
+        # - Origin is at the center of the frame
+        half_w = frame_width_mm / 2
+        half_h = frame_height_mm / 2
         dst_pts = np.array([
-            [0, frame_height_mm],          # bottom-left
-            [frame_width_mm, frame_height_mm],  # bottom-right
-            [frame_width_mm, 0],           # top-right
-            [0, 0]                         # top-left
+            [-half_w, -half_h],    # bottom-left (min X, min Y)
+            [ half_w, -half_h],    # bottom-right (max X, min Y)
+            [ half_w,  half_h],    # top-right (max X, max Y)
+            [-half_w,  half_h]     # top-left (min X, max Y)
         ], dtype=np.float32)
         
         self.homography, _ = cv2.findHomography(
@@ -159,70 +231,58 @@ class MicrophoneArrayCalibrator:
         self.transformed_mics = cv2.perspectiveTransform(
             mic_points_np, self.homography
         )[0]
-
-        # Now let the user select the origin
-        print("\n=== Origin Selection ===")
-        print("Select the origin point (0,0) on the warped image")
-        print("Microphone positions will be calculated relative to this point")
         
-        # Create a warped view for origin selection
+        # Get the origin point (either selected by user or use center of frame)
+        if hasattr(self, 'origin'):
+            origin_pt = np.array([self.origin[0], self.origin[1], 1])
+        else:
+            # If no origin selected, use the center of the frame
+            frame_center = np.mean(np.array(self.frame_corners), axis=0)
+            origin_pt = np.array([frame_center[0], frame_center[1], 1])
+        
+        # Transform origin to real-world coordinates
+        origin_transformed = np.dot(self.homography, origin_pt)
+        origin_x = origin_transformed[0] / origin_transformed[2]
+        origin_y = origin_transformed[1] / origin_transformed[2]
+        
+        # Adjust mic positions relative to origin
+        self.transformed_mics = [(x - origin_x, y - origin_y) 
+                               for x, y in self.transformed_mics]
+        
+        # Create a visualization of the warped image with mic positions
         h, w = img.shape[:2]
         warped = cv2.warpPerspective(img, self.homography, 
                                    (int(frame_width_mm), int(frame_height_mm)))
         
-        origin_img = warped.copy()
-        origin_selected = [False]
-
-        def origin_click_event(event, x, y, flags, param):
-            nonlocal origin_img, warped
-            
-            # Update zoom window on mouse move
-            if event == cv2.EVENT_MOUSEMOVE and not origin_selected[0]:
-                zoomed = create_zoomed_view(origin_img, (x, y))
-                cv2.imshow(zoom_win, zoomed)
-            
-            # Handle origin selection
-            if event == cv2.EVENT_LBUTTONDOWN and not origin_selected[0]:
-                self.origin = np.array([x, y], dtype=np.float32)
-                origin_img = warped.copy()
-                
-                # Draw crosshair at origin
-                cv2.drawMarker(origin_img, (x, y), (0, 0, 255), 
-                             cv2.MARKER_CROSS, 30, 2)
-                cv2.putText(origin_img, "Origin (0,0)", (x+10, y-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # Draw microphone positions
-                for i, (mx, my) in enumerate(self.transformed_mics):
-                    px, py = int(mx), int(my)
-                    cv2.circle(origin_img, (px, py), 10, (255, 0, 0), -1)
-                    cv2.putText(origin_img, f"Mic {i+1}", (px+15, py-10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                
-                cv2.imshow('Select Origin', origin_img)
-                zoomed = create_zoomed_view(origin_img, (x, y))
-                cv2.imshow(zoom_win, zoomed)
-                origin_selected[0] = True
-
-        cv2.namedWindow('Select Origin', cv2.WINDOW_NORMAL)
-        cv2.imshow('Select Origin', warped)
-        cv2.setMouseCallback('Select Origin', origin_click_event)
-
-        # Show initial zoomed view
-        zoomed = create_zoomed_view(warped, 
-                                  (warped.shape[1]//2, warped.shape[0]//2))
-        cv2.imshow(zoom_win, zoomed)
-
-        # Wait for origin selection
-        while not origin_selected[0]:
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                cv2.destroyAllWindows()
-                return False
-
-        # Calculate final coordinates relative to origin
-        self.transformed_mics -= self.origin
+        # Draw the origin and mic positions on the warped image
+        vis_img = warped.copy()
         
+        # Draw the origin
+        ox, oy = int(origin_x), int(origin_y)
+        cv2.drawMarker(vis_img, (ox, oy), (0, 0, 255), 
+                     cv2.MARKER_CROSS, 30, 2)
+        cv2.putText(vis_img, "Origin (0,0)", (ox+10, oy-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Draw microphone positions
+        for i, (mx, my) in enumerate(self.transformed_mics):
+            # Convert back to warped image coordinates for visualization
+            px, py = int(mx + ox), int(my + oy)
+            cv2.circle(vis_img, (px, py), 10, (255, 0, 0), -1)
+            cv2.putText(vis_img, f"Mic {i+1}", (px+15, py-10),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        # Show the final result
+        cv2.namedWindow('Calibration Result', cv2.WINDOW_NORMAL)
+        cv2.imshow('Calibration Result', vis_img)
+        
+        # Show zoomed view of the origin
+        zoomed = create_zoomed_view(vis_img, (ox, oy))
+        cv2.imshow(zoom_win, zoomed)
+        
+        # Wait for a key press
+        print("\nCalibration complete! Press any key to continue...")
+        cv2.waitKey(0)
         cv2.destroyAllWindows()
         return True
 

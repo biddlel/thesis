@@ -3,9 +3,9 @@
 #include "linalg.h"
 
 // --- Configuration Constants ---
-const float SAMPLE_RATE = 44100.0f;
+const float SAMPLE_RATE = AUDIO_SAMPLE_RATE;
 const int FFT_SIZE = 256;
-const int AUDIO_BLOCK_SAMPLES = 128;
+const int AUDIO_BLOCK_SAMPLES = AUDIO_BLOCK_SAMPLES;
 const int NUM_BLOCKS_TO_COLLECT = FFT_SIZE / AUDIO_BLOCK_SAMPLES;
 const float SOUND_SPEED = 343000.0; // in mm/s
 
@@ -14,10 +14,10 @@ const float SOUND_SPEED = 343000.0; // in mm/s
 const int NUM_MICS = 4;
 struct MicCoordinate { float x, y, z; };
 MicCoordinate mic_coords[NUM_MICS] = {
-  {-25.0, -25.0, 0.0}, // Mic 1 (top-right)
-  { 25.0, -25.0, 0.0}, // Mic 2 (top-left)
-  {-25.0,  25.0, 0.0}, // Mic 3 (bottom-left)
-  { 25.0,  25.0, 0.0}  // Mic 4 (bottom-right)
+  { 96.41, 90.05, 0.0}, // Mic 1 (top-right)
+  {-98.08, 89.86, 0.0}, // Mic 2 (top-left)
+  {-99.13,-96.22, 0.0}, // Mic 3 (bottom-left)
+  { 96.84,-96.78, 0.0 }  // Mic 4 (bottom-right)
 };
 
 // --- MUSIC Algorithm Parameters ---

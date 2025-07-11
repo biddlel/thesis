@@ -1,35 +1,6 @@
-=== Microphone Selection ===
-Now select the 4 microphone positions:
-1. Bottom-left mic
-2. Bottom-right mic
-3. Top-left mic
-4. Top-right mic
-
-=== Origin Selection ===
-Select the origin point (0,0) on the warped image
-Microphone positions will be calculated relative to this point
-
-=== Calibration Results ===
-Microphone positions (in mm, relative to origin):
-{
-  {  -100.53,    94.71, 0.0 },  // Bottom-left (Mic 1)
-  {    95.49,    95.13, 0.0 },  // Bottom-right (Mic 2)
-  {    95.21,   -91.55, 0.0 },  // Top-left (Mic 3)
-  {   -99.31,   -91.43, 0.0 },  // Top-right (Mic 4)
-}
-
-C++ array for Teensy code:
-const float mic_positions[4][3] = {
-  {  -100.53,    94.71, 0.0 },  // Bottom-left (Mic 1)
-  {    95.49,    95.13, 0.0 },  // Bottom-right (Mic 2)
-  {    95.21,   -91.55, 0.0 },  // Top-left (Mic 3)
-  {   -99.31,   -91.43, 0.0 }  // Top-right (Mic 4)
+MicCoordinate mic_coords[NUM_MICS] = {
+  { 96.41, 90.05, 0.0}, // Mic 1 (top-right)
+  {-98.08, 89.86, 0.0}, // Mic 2 (top-left)
+  {-99.13,-96.22, 0.0}, // Mic 3 (bottom-left)
+  { 96.84,-96.78, 0.0 }  // Mic 4 (bottom-right)
 };
-
-Microphone Positions Summary:
-----------------------------------------
-Bottom-left: X:  -100.53 mm, Y:    94.71 mm
-Bottom-right: X:    95.49 mm, Y:    95.13 mm
-Top-left:    X:    95.21 mm, Y:   -91.55 mm
-Top-right:   X:   -99.31 mm, Y:   -91.43 mm
-----------------------------------------
