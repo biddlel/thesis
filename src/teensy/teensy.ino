@@ -51,6 +51,7 @@ float music_spectrum[GRID_X_STEPS][GRID_Y_STEPS];
 
 void setup() {
   Serial.begin(9600);
+  Serial1.begin(115200);
   while (!Serial && millis() < 4000) {}
 
   // Start the audio queues
@@ -221,4 +222,9 @@ void run_music_algorithm() {
   Serial.print(est_x, 1);
   Serial.print(", Y=");
   Serial.println(est_y, 1);
+
+  Serial1.print("Estimated Coords (mm): X=");
+  Serial1.print(est_x, 1);
+  Serial1.print(", Y=");
+  Serial1.println(est_y, 1);
 }
