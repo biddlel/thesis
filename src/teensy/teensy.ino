@@ -5,7 +5,7 @@
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
-const int FFT_SIZE = 256;
+const int FFT_SIZE = 1024;
 const int NUM_BLOCKS_TO_COLLECT = FFT_SIZE / AUDIO_BLOCK_SAMPLES;
 const float SOUND_SPEED = 343000.0; // in mm/s
 
@@ -22,32 +22,49 @@ MicCoordinate mic_coords[NUM_MICS] = {
 
 // --- MUSIC Algorithm Parameters ---
 const int NUM_SOURCES = 1;
-const int START_FREQ_BIN = 5;     // Freq bin to start analysis (avoid DC)
-const int END_FREQ_BIN = 40;      // Freq bin to end analysis
+const int START_FREQ_BIN = 10;     // Freq bin to start analysis (avoid DC)
+const int END_FREQ_BIN = 100;      // Freq bin to end analysis
+const float NOISE_FLOOR = 1e-6f;    // Small value to avoid division by zero
+const float MIN_EIGENVALUE = 1e-10f; // Minimum eigenvalue to consider
 
 // --- Localization Search Grid Configuration ---
-const float TARGET_PLANE_Z = -500.0; // Z-height of the plane to search (mm)
-const float GRID_X_MIN = -1000.0;    // Search area min X (mm)
-const float GRID_X_MAX =  1000.0;    // Search area max X (mm)
-const int   GRID_X_STEPS = 100;       // Number of steps in X direction
-const float GRID_Y_MIN = -1000.0;    // Search area min Y (mm)
-const float GRID_Y_MAX =  1000.0;    // Search area max Y (mm)
-const int   GRID_Y_STEPS = 100;       // Number of steps in Y direction
+const float GRID_SEARCH = 1000;    // Search radius in mm
+const int STEPS = 20;             // Number of steps per dimension (reduced for 3D search)
+
+// 3D Search space boundaries (in mm)
+const float GRID_X_MIN = -GRID_SEARCH;    // Min X coordinate
+const float GRID_X_MAX =  GRID_SEARCH;    // Max X coordinate
+const float GRID_Y_MIN = -GRID_SEARCH;    // Min Y coordinate
+const float GRID_Y_MAX =  GRID_SEARCH;    // Max Y coordinate
+const float GRID_Z_MIN =  100.0;          // Min Z coordinate (don't search too close to mics)
+const float GRID_Z_MAX = 1000.0;          // Max Z coordinate
+
+// Number of steps in each dimension
+const int GRID_X_STEPS = STEPS;
+const int GRID_Y_STEPS = STEPS;
+const int GRID_Z_STEPS = 10;  // Fewer steps in Z to reduce computation
 
 // --- Audio System Setup ---
 AudioInputI2SQuad    i2s_quad;
-AudioFilterSPH0645   mic_correction[NUM_MICS];
+// AudioFilterSPH0645   mic_correction[NUM_MICS];
 AudioRecordQueue     queues[NUM_MICS];
 AudioConnection*     patchCords[NUM_MICS];
-AudioConnection*     correctionConnection[NUM_MICS];
+// AudioConnection*     correctionConnection[NUM_MICS];
 
 // --- Buffers and Variables ---
 int16_t mic_buffers[NUM_MICS][FFT_SIZE];
 int blocks_collected = 0;
 float32_t fft_inputs[NUM_MICS][FFT_SIZE];
-float32_t fft_outputs[NUM_MICS][FFT_SIZE];  // Only need N/2+1 complex numbers for real FFT
+float32_t fft_outputs[NUM_MICS][FFT_SIZE];         // FFT outputs for each mic
 arm_rfft_fast_instance_f32 fft_inst;
-float music_spectrum[GRID_X_STEPS][GRID_Y_STEPS];
+
+// 3D MUSIC spectrum (using 1D array for better memory management)
+float music_spectrum[GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS];
+
+// Helper function to convert 3D grid indices to 1D array index
+inline int gridToIndex(int ix, int iy, int iz) {
+  return ix + GRID_X_STEPS * (iy + GRID_Y_STEPS * iz);
+}
 
 void setup() {
   Serial.begin(9600);
@@ -55,13 +72,13 @@ void setup() {
   while (!Serial && millis() < 4000) {}
 
   // Start the audio queues
-  AudioMemory(120);
+  AudioMemory(240);
   // Serial.print("Audio memory allocated: ");
   // Serial.println(AudioMemoryUsageMax());
   
   for(int i=0; i<NUM_MICS; ++i) {
-    correctionConnection[i] = new AudioConnection(i2s_quad, i, mic_correction[i], 0);
-    patchCords[i] = new AudioConnection(mic_correction[i], 0, queues[i], 0);
+    // correctionConnection[i] = new AudioConnection(i2s_quad, i, mic_correction[i], 0);
+    patchCords[i] = new AudioConnection(i2s_quad, i, queues[i], 0);
     queues[i].begin();
     // Serial.print("Started queue for mic ");
     // Serial.println(i);
@@ -132,9 +149,12 @@ void run_music_algorithm() {
     // Serial.println(i);
   }
 
-  // 2. Clear the broadband music spectrum
-  // Serial.println("2. Clearing music spectrum...");
-  for(int ix=0; ix<GRID_X_STEPS; ++ix) for(int iy=0; iy<GRID_Y_STEPS; ++iy) music_spectrum[ix][iy] = 0.0;
+  // 2. Reset the spectrum
+  // Serial.println("1. Resetting spectrum...");
+  int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  for(int i=0; i<total_points; ++i) {
+    music_spectrum[i] = 0.0;
+  }
 
   // 3. Iterate over frequency bins to build the broadband spectrum
   for (int k = START_FREQ_BIN; k < END_FREQ_BIN; ++k) {
@@ -154,77 +174,115 @@ void run_music_algorithm() {
     Complex eigenvectors[NUM_MICS][NUM_MICS];
     eigen_decomposition_hermitian_4x4(scm, eigenvalues, eigenvectors);
 
-    // 5. Compute MUSIC pseudospectrum for this frequency bin by searching the grid
+    // 5. Compute MUSIC pseudospectrum for this frequency bin by searching the 3D grid
     for (int ix = 0; ix < GRID_X_STEPS; ++ix) {
+      float current_x = GRID_X_MIN + (float)ix * (GRID_X_MAX - GRID_X_MIN) / (GRID_X_STEPS - 1);
+      
       for (int iy = 0; iy < GRID_Y_STEPS; ++iy) {
-        float current_x = GRID_X_MIN + (float)ix * (GRID_X_MAX - GRID_X_MIN) / (GRID_X_STEPS - 1);
         float current_y = GRID_Y_MIN + (float)iy * (GRID_Y_MAX - GRID_Y_MIN) / (GRID_Y_STEPS - 1);
         
-        // 6. Compute steering vector for this grid point (spherical wave model)
-        Complex steering_vector[NUM_MICS];
-        float dx0 = current_x - mic_coords[0].x, dy0 = current_y - mic_coords[0].y, dz0 = TARGET_PLANE_Z - mic_coords[0].z;
-        float dist0 = sqrt(dx0*dx0 + dy0*dy0 + dz0*dz0);
-
-        for(int mic=0; mic<NUM_MICS; ++mic) {
-          float dxi = current_x - mic_coords[mic].x, dyi = current_y - mic_coords[mic].y, dzi = TARGET_PLANE_Z - mic_coords[mic].z;
-          float disti = sqrt(dxi*dxi + dyi*dyi + dzi*dzi);
-          float time_diff = (disti - dist0) / SOUND_SPEED;
-          float phase_delay = 2.0f * PI * freq_hz * time_diff;
-          arm_sin_cos_f32(phase_delay, &steering_vector[mic].im, &steering_vector[mic].re);
-          steering_vector[mic].im *= -1; // exp(-j*theta)
-        }
-
-        // 7. Calculate pseudospectrum value and add to the grid
-        Complex total_proj(0,0);
-        for (int n = 0; n < NUM_MICS - NUM_SOURCES; ++n) { // Project onto noise subspace
-          Complex proj(0,0);
+        for (int iz = 0; iz < GRID_Z_STEPS; ++iz) {
+          float current_z = GRID_Z_MIN + (float)iz * (GRID_Z_MAX - GRID_Z_MIN) / (GRID_Z_STEPS - 1);
+          
+          // 6. Compute and normalize steering vector for this 3D grid point (spherical wave model)
+          Complex steering_vector[NUM_MICS];
+          float dx0 = current_x - mic_coords[0].x;
+          float dy0 = current_y - mic_coords[0].y;
+          float dz0 = current_z - mic_coords[0].z;
+          float dist0 = sqrtf(dx0*dx0 + dy0*dy0 + dz0*dz0);
+          
+          // Calculate steering vector and its norm
+          float norm_factor = 0.0f;
           for(int mic=0; mic<NUM_MICS; ++mic) {
-            proj = proj + steering_vector[mic].conj() * eigenvectors[mic][n];
+              float dxi = current_x - mic_coords[mic].x;
+              float dyi = current_y - mic_coords[mic].y;
+              float dzi = current_z - mic_coords[mic].z;
+              float disti = sqrtf(dxi*dxi + dyi*dyi + dzi*dzi);
+              float time_diff = (disti - dist0) / SOUND_SPEED;
+              float phase = 2.0f * PI * freq_hz * time_diff;
+              
+              // Store complex exponential
+              arm_sin_cos_f32(phase, &steering_vector[mic].im, &steering_vector[mic].re);
+              steering_vector[mic].im = -steering_vector[mic].im;  // exp(-j*theta)
+              
+              // Accumulate for normalization
+              norm_factor += steering_vector[mic].re * steering_vector[mic].re + 
+                            steering_vector[mic].im * steering_vector[mic].im;
           }
-          total_proj = total_proj + proj * proj.conj();
+          
+          // Normalize steering vector (add noise floor to avoid division by zero)
+          norm_factor = sqrtf(norm_factor) + NOISE_FLOOR;
+          for(int mic=0; mic<NUM_MICS; ++mic) {
+              steering_vector[mic].re /= norm_factor;
+              steering_vector[mic].im /= norm_factor;
+          }
+
+          // 7. Calculate pseudospectrum value with eigenvalue weighting
+          float pseudo_spectrum = 0.0f;
+          for (int n = 0; n < NUM_MICS - NUM_SOURCES; ++n) { // Project onto noise subspace
+              // Skip very small eigenvalues
+              if (eigenvalues[n] < MIN_EIGENVALUE) continue;
+              
+              Complex proj(0,0);
+              for(int mic=0; mic<NUM_MICS; ++mic) {
+                  proj = proj + steering_vector[mic].conj() * eigenvectors[mic][n];
+              }
+              // Weight by inverse of eigenvalue (MUSIC pseudospectrum)
+              float weight = 1.0f / (eigenvalues[n] + NOISE_FLOOR);
+              pseudo_spectrum += weight * (proj * proj.conj()).re;
+          }
+          // Add to the broadband spectrum
+          if (pseudo_spectrum > 1e-9) {
+              int idx = gridToIndex(ix, iy, iz);
+              music_spectrum[idx] += pseudo_spectrum;
+          }
         }
-        if(total_proj.re > 1e-9) music_spectrum[ix][iy] += 1.0f / total_proj.re;
       }
     }
   }
 
-  // 8. Find the peak in the 2D spectrum
+  // 8. Find the peak in the 3D spectrum
   // Serial.println("8. Finding peak in spectrum...");
-  float max_val = -1.0; int max_ix = -1, max_iy = -1;
+  float max_val = -1.0; 
+  int max_ix = -1, max_iy = -1, max_iz = -1;
+  
   for (int ix = 0; ix < GRID_X_STEPS; ix++) {
     for (int iy = 0; iy < GRID_Y_STEPS; iy++) {
-      if (music_spectrum[ix][iy] > max_val) {
-        max_val = music_spectrum[ix][iy];
-        max_ix = ix; max_iy = iy;
+      for (int iz = 0; iz < GRID_Z_STEPS; iz++) {
+        int idx = gridToIndex(ix, iy, iz);
+        if (music_spectrum[idx] > max_val) {
+          max_val = music_spectrum[idx];
+          max_ix = ix; 
+          max_iy = iy;
+          max_iz = iz;
+        }
       }
     }
   }
   
-  // 9. Convert peak index back to coordinates
+  // 9. Convert peak index back to 3D coordinates
   // Serial.println("9. Converting peak to coordinates...");
   float est_x = GRID_X_MIN + (float)max_ix * (GRID_X_MAX - GRID_X_MIN) / (GRID_X_STEPS - 1);
   float est_y = GRID_Y_MIN + (float)max_iy * (GRID_Y_MAX - GRID_Y_MIN) / (GRID_Y_STEPS - 1);
+  float est_z = GRID_Z_MIN + (float)max_iz * (GRID_Z_MAX - GRID_Z_MIN) / (GRID_Z_STEPS - 1);
   
-  // Debug: Print some audio samples to verify we're getting data
-  // Serial.println("Sample audio data (first 5 samples from each mic):");
-  // for(int i=0; i<NUM_MICS; ++i) {
-  //   Serial.print("Mic ");
-  //   Serial.print(i);
-  //   Serial.print(": ");
-  //   for(int j=0; j<5; ++j) {
-  //     Serial.print(mic_buffers[i][j]);
-  //     Serial.print(" ");
-  //   }
-  //   Serial.println();
-  // }
-
-  Serial.print("Estimated Coords (mm): X=");
-  Serial.print(est_x, 1);
-  Serial.print(", Y=");
-  Serial.println(est_y, 1);
-
-  Serial1.print("Estimated Coords (mm): X=");
-  Serial1.print(est_x, 1);
-  Serial1.print(", Y=");
-  Serial1.println(est_y, 1);
+  // Output the estimated 3D coordinates
+  if (Serial) {
+    Serial.print("Estimated 3D Coords (mm): X=");
+    Serial.print(est_x, 1);
+    Serial.print(", Y=");
+    Serial.print(est_y, 1);
+    Serial.print(", Z=");
+    Serial.println(est_z, 1);
+  }
+  
+  // Also output to Serial1 if connected (e.g., for Raspberry Pi)
+  if (Serial1) {
+    Serial1.print("Estimated 3D Coords (mm): X=");
+    Serial1.print(est_x, 1);
+    Serial1.print(", Y=");
+    Serial1.print(est_y, 1);
+    Serial1.print(", Z=");
+    Serial1.println(est_z, 1);
+  }
 }
