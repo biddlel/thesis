@@ -22,6 +22,8 @@ const float C = 343.0f;                   // Speed of sound (m/s)
 const int MAX_FREQ = 8000;                // Maximum frequency for XSRP (Hz)
 const int MAX_FREQ_BIN = (int)(MAX_FREQ * FFT_SIZE / FS);
 
+const int NUM_BLOCKS_TO_COLLECT = FFT_SIZE / AUDIO_BLOCK_SAMPLES;
+
 // Search grid parameters (in mm)
 const float GRID_MIN_X = -1000.0f;
 const float GRID_MAX_X = 1000.0f;
@@ -211,55 +213,41 @@ void setup() {
 }
 
 void loop() {
-  // if (millis() - last_debug_print > 1000) {
-  //   last_debug_print = millis();
-  //   Serial.print("CPU: ");
-  //   Serial.print(AudioProcessorUsage());
-  //   Serial.print("% max: ");
-  //   Serial.print(AudioProcessorUsageMax());
-  //   Serial.print("%, Queues: ");
-  //   for(int i = 0; i < NUM_MICS; i++) {
-  //     Serial.print(queues[i].available());
-  //     Serial.print("/");
-  //   }
-  //   Serial.println();
-  // }
-  
-  bool all_queues_ready = true;
+  for(int i=0; i<NUM_MICS; ++i) {
+    if(queues[i].available() == 0) { all_queues_ready = false; break; }
+  }
 
-  // Temporary buffer for windowed audio
-  static float windowed_audio[FFT_SIZE];
-  
-  // Read audio blocks from all microphones
-  for (int i = 0; i < FFT_SIZE / AUDIO_BLOCK_SAMPLES; i++) {
-    // Get audio blocks from each microphone
-    audio_block_t* blocks[NUM_MICS];
-    bool all_blocks_valid = true;
-    
-    for (int m = 0; m < NUM_MICS; m++) {
-      blocks[m] = queues[m].readBuffer();
-      if (!blocks[m]) {
-        all_blocks_valid = false;
-        break;
+  if (all_queues_ready) {
+    // Serial.println("All queues ready, collecting blocks...");
+    // Serial.print("Blocks collected: ");
+    // Serial.println(blocks_collected);
+    for(int i=0; i<NUM_MICS; ++i) {
+      int16_t *data = queues[i].readBuffer();
+      if (data) {  // Check if data is valid
+        memcpy(mic_buffers[i] + (blocks_collected * AUDIO_BLOCK_SAMPLES), data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
+        queues[i].freeBuffer();
+        // Serial.print("  Mic ");
+        // Serial.print(i);
+        // Serial.println(" data copied");
+      } else {
+        // Serial.print("  No data from mic ");
+        // Serial.println(i);
       }
     }
-    
-    if (all_blocks_valid) {
-      // Copy samples to buffer (keep as int16_t)
-      for (int m = 0; m < NUM_MICS; m++) {
-        int offset = i * AUDIO_BLOCK_SAMPLES;
-        memcpy(&mic_buffers[m][offset], blocks[m]->data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
-        queues[m].freeBuffer();
-      }  
-    }
-    
     blocks_collected++;
+
+    if (blocks_collected >= NUM_BLOCKS_TO_COLLECT) {
+      // Serial.println("\n--- Starting MUSIC algorithm ---");
+      process_audio();
+      blocks_collected = 0;
+      // Serial.println("--- MUSIC algorithm completed ---\n");
+    }
   }
   
   // Check if we've collected enough blocks for processing
   if (blocks_collected >= (FFT_SIZE / AUDIO_BLOCK_SAMPLES)) {
     // Serial.println("Data read. Processing audio...");
-    process_audio();
+    ;
     blocks_collected = 0;  // Reset for next batch
   }
 }
