@@ -7,23 +7,11 @@
 #include <arm_const_structs.h>
 #include <complex>
 
-// Audio objects
-AudioInputI2S            i2s1;           // Main I2S input
-AudioRecordQueue         queue1;         // Queue for microphone 1
-AudioRecordQueue         queue2;         // Queue for microphone 2
-AudioConnection          patchCord1(i2s1, 0, queue1, 0);
-AudioConnection          patchCord2(i2s1, 1, queue2, 0);
-AudioControlSGTL5000     sgtl5000_1;     // Audio shield control
 
-// Microphone coordinates in mm (x, y, z)
-const float mic_pos[2][3] = {
-  { 96.41,  90.05, 0.0},  // Mic 1 (top-right)
-  {-98.08,  89.86, 0.0},  // Mic 2 (top-left)
-};
 
 // XSRP (SRP-PHAT) Parameters
 const int FFT_SIZE = 256;                 // FFT size (power of 2)
-const int NUM_MICS = 2;                   // Number of microphones
+const int NUM_MICS = 4;                   // Number of microphones
 const float FS = AUDIO_SAMPLE_RATE_EXACT; // Sample rate (Hz)
 const float C = 343.0f;                   // Speed of sound (m/s)
 const float MIC_DISTANCE = 0.1f;          // Approximate distance between mics (m)
@@ -41,6 +29,22 @@ const int GRID_STEPS_X = 20;
 const int GRID_STEPS_Y = 20;
 const int GRID_STEPS_Z = 5;
 
+
+// Audio objects
+AudioInputI2SQuad    i2s_quad;
+// AudioFilterSPH0645   mic_correction[NUM_MICS];
+AudioRecordQueue     queues[NUM_MICS];
+AudioConnection*     patchCords[NUM_MICS];
+
+
+// Microphone coordinates in mm (x, y, z)
+const float mic_pos[NUM_MICS][3] = {
+  { 96.41, 90.05, 0.0}, // Mic 1 (top-right)
+  {-98.08, 89.86, 0.0}, // Mic 2 (top-left)
+  {-99.13,-96.22, 0.0}, // Mic 3 (bottom-left)
+  { 96.84,-96.78, 0.0 } // Mic 4 (bottom-right)
+};
+
 // FFT and buffer variables
 arm_rfft_fast_instance_f32 fft_inst;
 float fft_input[FFT_SIZE * 2];  // Real and imaginary parts interleaved
@@ -53,6 +57,10 @@ std::complex<float> mic_fft[NUM_MICS][FFT_SIZE / 2 + 1];
 
 // Window function (Hann)
 float window[FFT_SIZE];
+
+// Debug and timing variables
+unsigned long last_debug_print = 0;
+int blocks_collected = 0;
 
 // Helper function to calculate distance between two 3D points
 float distance(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -124,9 +132,9 @@ void compute_fft(float* input, std::complex<float>* output) {
 }
 
 void setup() {
-  delay(3000); // Wait for serial to initialize
   Serial.begin(115200);
   Serial1.begin(115200);  // For communication with Raspberry Pi
+  while (!Serial && !Serial1 && millis() < 4000) {}
   
   Serial.println("Starting setup...");
   
@@ -143,13 +151,18 @@ void setup() {
   Serial.println("Starting audio processing...");
   AudioProcessorUsageMaxReset();
   AudioMemoryUsageMaxReset();
-  
-  // Start the queues
+
   Serial.println("Starting audio queues...");
-  queue1.begin();
-  queue2.begin();
+  for(int i=0; i<NUM_MICS; ++i) {
+    // correctionConnection[i] = new AudioConnection(i2s_quad, i, mic_correction[i], 0);
+    patchCords[i] = new AudioConnection(i2s_quad, i, queues[i], 0);
+    queues[i].begin();
+    // Serial.print("Started queue for mic ");
+    // Serial.println(i);
+  }
   Serial.println("Audio queues started.");
-  
+  // Start the queues
+     
   // Initialize FFT
   Serial.println("Initializing FFT...");
   if (arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE) != ARM_MATH_SUCCESS) {
@@ -184,79 +197,54 @@ void setup() {
 }
 
 void loop() {
-  Serial.println("Top of loop()");
-  static unsigned long lastPrint = 0;
-  static unsigned long loopCount = 0;
-  
-  loopCount++;
-  
-  // Simple watchdog to detect hangs
-  if (millis() - lastPrint > 1000) {
-    lastPrint = millis();
-    Serial.print("Loop count: ");
-    Serial.print(loopCount);
-    Serial.print(", Audio memory: ");
-    Serial.print(AudioMemoryUsage());
-    Serial.print("/");
-    Serial.print(AudioMemoryUsageMax());
-    Serial.print(" blocks, CPU: ");
+  if (millis() - last_debug_print > 1000) {
+    last_debug_print = millis();
+    Serial.print("CPU: ");
     Serial.print(AudioProcessorUsage());
     Serial.print("% max: ");
     Serial.print(AudioProcessorUsageMax());
     Serial.print("%, Queues: ");
-    Serial.print(queue1.available());
-    Serial.print("/");
-    Serial.print(queue2.available());
-    Serial.print("/");
-    Serial.print(queue3.available());
-    Serial.print("/");
-    Serial.println(queue4.available());
+    for(int i = 0; i < NUM_MICS; i++) {
+      Serial.print(queues[i].available());
+      Serial.print("/");
+    }
+    Serial.println();
   }
   
-  // Check each queue for data
-  static int lastQueue1 = 0, lastQueue2 = 0;
-  int q1 = queue1.available();
-  int q2 = queue2.available();
-  
-  // Print queue status if it changes
-  if (q1 != lastQueue1 || q2 != lastQueue2) {
-    Serial.print("Queues: ");
-    Serial.print(q1);
-    Serial.print("/");
-    Serial.println(q2);
-    lastQueue1 = q1;
-    lastQueue2 = q2;
-  }
-  
+  bool all_queues_ready = true;
+
   // Check if all queues have data available
-  bool allQueuesReady = (q1 > 0) && (q2 > 0);
+  for(int i=0; i<NUM_MICS; ++i) {
+    if(queues[i].available() == 0) { all_queues_ready = false; break; }
+  }
   
-  if (allQueuesReady) {
+  if (all_queues_ready) {
     Serial.println("All queues ready. Reading data...");
     
-    // Read audio blocks from all microphones
-    for (int i = 0; i < FFT_SIZE / AUDIO_BLOCK_SAMPLES; i++) {
-      int16_t* block1 = queue1.readBuffer();
-      int16_t* block2 = queue2.readBuffer();
-      
-      // Copy samples to buffer (convert to float and normalize)
-      for (int j = 0; j < AUDIO_BLOCK_SAMPLES; j++) {
-        int idx = i * AUDIO_BLOCK_SAMPLES + j;
-        if (idx < FFT_SIZE) {
-          mic_buffers[0][idx] = block1[j] / 32768.0f;
-          mic_buffers[1][idx] = block2[j] / 32768.0f;
+    for(int i=0; i<NUM_MICS; ++i) {
+      int16_t *data = queues[i].readBuffer();
+      if (data) {  // Check if data is valid
+        // First copy the data to a temporary buffer
+        int16_t temp_buffer[AUDIO_BLOCK_SAMPLES];
+        memcpy(temp_buffer, data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
+    
+        // Then convert to float and copy to mic_buffers
+        for(int j = 0; j < AUDIO_BLOCK_SAMPLES; j++) {
+            mic_buffers[i][(blocks_collected * AUDIO_BLOCK_SAMPLES) + j] = (float)temp_buffer[j] / 32768.0f;
         }
+
+        queues[i].freeBuffer();
       }
-      
-      // Free the audio blocks
-      queue1.freeBuffer();
-      queue2.freeBuffer();
     }
     
-    Serial.println("Data read. Processing audio...");
-    // Process the audio
-    process_audio();
-    Serial.println("Audio processing finished.");
+    blocks_collected++;
+    
+    // Check if we've collected enough blocks for processing
+    if (blocks_collected >= (FFT_SIZE / AUDIO_BLOCK_SAMPLES)) {
+      Serial.println("Data read. Processing audio...");
+      process_audio();
+      blocks_collected = 0;  // Reset for next batch
+    }
   }
 }
 
