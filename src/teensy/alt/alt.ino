@@ -7,15 +7,19 @@
 #include <arm_const_structs.h>
 #include <complex>
 
+#include "AudioFilterSPH0645.h"
 
+// Constants
+
+const float SOUND_SPEED = 343.0f; // Speed of sound in m/s
+const float MIN_LEVEL = 0.01f; // Minimum signal level to process
 
 // XSRP (SRP-PHAT) Parameters
 const int FFT_SIZE = 256;                 // FFT size (power of 2)
 const int NUM_MICS = 4;                   // Number of microphones
 const float FS = AUDIO_SAMPLE_RATE_EXACT; // Sample rate (Hz)
 const float C = 343.0f;                   // Speed of sound (m/s)
-const float MIC_DISTANCE = 0.1f;          // Approximate distance between mics (m)
-const int MAX_FREQ = 4000;                // Maximum frequency for XSRP (Hz)
+const int MAX_FREQ = 8000;                // Maximum frequency for XSRP (Hz)
 const int MAX_FREQ_BIN = (int)(MAX_FREQ * FFT_SIZE / FS);
 
 // Search grid parameters (in mm)
@@ -29,13 +33,12 @@ const int GRID_STEPS_X = 20;
 const int GRID_STEPS_Y = 20;
 const int GRID_STEPS_Z = 5;
 
-
 // Audio objects
 AudioInputI2SQuad    i2s_quad;
-// AudioFilterSPH0645   mic_correction[NUM_MICS];
+AudioFilterSPH0645   mic_correction[NUM_MICS];
 AudioRecordQueue     queues[NUM_MICS];
 AudioConnection*     patchCords[NUM_MICS];
-
+AudioConnection*     correctionConnection[NUM_MICS];
 
 // Microphone coordinates in mm (x, y, z)
 const float mic_pos[NUM_MICS][3] = {
@@ -52,7 +55,7 @@ float fft_magnitude[FFT_SIZE / 2 + 1];
 float fft_phase[FFT_SIZE / 2 + 1];
 
 // Buffers for each microphone
-float mic_buffers[NUM_MICS][FFT_SIZE];
+int16_t mic_buffers[NUM_MICS][FFT_SIZE];
 std::complex<float> mic_fft[NUM_MICS][FFT_SIZE / 2 + 1];
 
 // Window function (Hann)
@@ -70,10 +73,10 @@ float distance(float x1, float y1, float z1, float x2, float y2, float z2) {
   return sqrtf(dx*dx + dy*dy + dz*dz);
 }
 
-// Apply window function to data
-void apply_window(float* data, int length) {
+// Apply window function to data and convert to float
+void apply_window(int16_t* input, float* output, int length) {
   for (int i = 0; i < length; i++) {
-    data[i] *= window[i];
+    output[i] = (input[i] / 32768.0f) * window[i];  // Convert to float and apply window
   }
 }
 
@@ -83,6 +86,17 @@ void compute_srp_phat();
 float calculate_tdoa(float x, float y, float z, int mic1, int mic2);
 void find_peak_position(float& x, float& y, float& z);
 void compute_fft(float* input, std::complex<float>* output);
+float get_audio_level(const float* buffer, int length);
+
+// Calculate audio level (RMS) of a buffer
+float get_audio_level(const int16_t* buffer, int length) {
+  float sum = 0.0f;
+  for (int i = 0; i < length; i++) {
+    float sample = buffer[i] / 32768.0f;  // Convert to float in range [-1.0, 1.0]
+    sum += sample * sample;
+  }
+  return sqrtf(sum / length);
+}
 
 // Helper function to find peak in SRP map
 void find_peak_position(float& x, float& y, float& z) {
@@ -136,43 +150,43 @@ void setup() {
   Serial1.begin(115200);  // For communication with Raspberry Pi
   while (!Serial && !Serial1 && millis() < 4000) {}
   
-  Serial.println("Starting setup...");
+  // Serial.println("Starting setup...");
   
   // Initialize audio memory and queues
-  Serial.println("Initializing audio memory...");
+  // Serial.println("Initializing audio memory...");
   AudioMemory(100); // Increased from 20 to 100 for stability
-  Serial.print("Audio memory initialized. Blocks: ");
+  // Serial.print("Audio memory initialized. Blocks: ");
   Serial.println(AudioMemoryUsageMax());
   
   // Enable the audio shield
-  Serial.println("Enabling audio shield...");
+  // Serial.println("Enabling audio shield...");
   
   // Start the audio processing
-  Serial.println("Starting audio processing...");
+  // Serial.println("Starting audio processing...");
   AudioProcessorUsageMaxReset();
   AudioMemoryUsageMaxReset();
 
-  Serial.println("Starting audio queues...");
+  // Serial.println("Starting audio queues...");
   for(int i=0; i<NUM_MICS; ++i) {
-    // correctionConnection[i] = new AudioConnection(i2s_quad, i, mic_correction[i], 0);
-    patchCords[i] = new AudioConnection(i2s_quad, i, queues[i], 0);
+    correctionConnection[i] = new AudioConnection(i2s_quad, i, mic_correction[i], 0);
+    patchCords[i] = new AudioConnection(mic_correction[i], 0, queues[i], 0);
     queues[i].begin();
     // Serial.print("Started queue for mic ");
     // Serial.println(i);
   }
-  Serial.println("Audio queues started.");
+  // Serial.println("Audio queues started.");
   // Start the queues
      
   // Initialize FFT
-  Serial.println("Initializing FFT...");
+  // Serial.println("Initializing FFT...");
   if (arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE) != ARM_MATH_SUCCESS) {
     Serial.println("FFT initialization failed!");
     while(1); // Halt on error
   }
-  Serial.println("FFT initialized successfully.");
+  // Serial.println("FFT initialized successfully.");
   
   // Initialize Hann window
-  Serial.println("Initializing Hann window...");
+  // Serial.println("Initializing Hann window...");
   for (int i = 0; i < FFT_SIZE; i++) {
     window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (FFT_SIZE - 1)));
     if (!isfinite(window[i])) {
@@ -181,79 +195,103 @@ void setup() {
       while(1); // Halt on error
     }
   }
-  Serial.println("Hann window initialized.");
+  // Serial.println("Hann window initialized.");
   
-  Serial.println("XSRP (SRP-PHAT) Sound Source Localization Started");
-  Serial.print("Sample rate: ");
-  Serial.print(FS);
-  Serial.println(" Hz");
-  Serial.print("FFT size: ");
-  Serial.println(FFT_SIZE);
-  Serial.print("Audio block samples: ");
-  Serial.println(AUDIO_BLOCK_SAMPLES);
-  Serial.print("FFT blocks needed: ");
-  Serial.println(FFT_SIZE / AUDIO_BLOCK_SAMPLES);
-  Serial.println("Setup complete. Starting main loop...");
+  // Serial.println("XSRP (SRP-PHAT) Sound Source Localization Started");
+  // Serial.print("Sample rate: ");
+  // Serial.print(FS);
+  // Serial.println(" Hz");
+  // Serial.print("FFT size: ");
+  // Serial.println(FFT_SIZE);
+  // Serial.print("Audio block samples: ");
+  // Serial.println(AUDIO_BLOCK_SAMPLES);
+  // Serial.print("FFT blocks needed: ");
+  // Serial.println(FFT_SIZE / AUDIO_BLOCK_SAMPLES);
+  // Serial.println("Setup complete. Starting main loop...");
 }
 
 void loop() {
-  if (millis() - last_debug_print > 1000) {
-    last_debug_print = millis();
-    Serial.print("CPU: ");
-    Serial.print(AudioProcessorUsage());
-    Serial.print("% max: ");
-    Serial.print(AudioProcessorUsageMax());
-    Serial.print("%, Queues: ");
-    for(int i = 0; i < NUM_MICS; i++) {
-      Serial.print(queues[i].available());
-      Serial.print("/");
-    }
-    Serial.println();
-  }
+  // if (millis() - last_debug_print > 1000) {
+  //   last_debug_print = millis();
+  //   Serial.print("CPU: ");
+  //   Serial.print(AudioProcessorUsage());
+  //   Serial.print("% max: ");
+  //   Serial.print(AudioProcessorUsageMax());
+  //   Serial.print("%, Queues: ");
+  //   for(int i = 0; i < NUM_MICS; i++) {
+  //     Serial.print(queues[i].available());
+  //     Serial.print("/");
+  //   }
+  //   Serial.println();
+  // }
   
   bool all_queues_ready = true;
 
-  // Check if all queues have data available
-  for(int i=0; i<NUM_MICS; ++i) {
-    if(queues[i].available() == 0) { all_queues_ready = false; break; }
-  }
+  // Temporary buffer for windowed audio
+  static float windowed_audio[FFT_SIZE];
   
-  if (all_queues_ready) {
-    Serial.println("All queues ready. Reading data...");
+  // Read audio blocks from all microphones
+  for (int i = 0; i < FFT_SIZE / AUDIO_BLOCK_SAMPLES; i++) {
+    // Get audio blocks from each microphone
+    audio_block_t* blocks[NUM_MICS];
+    bool all_blocks_valid = true;
     
-    for(int i=0; i<NUM_MICS; ++i) {
-      int16_t *data = queues[i].readBuffer();
-      if (data) {  // Check if data is valid
-        // First copy the data to a temporary buffer
-        int16_t temp_buffer[AUDIO_BLOCK_SAMPLES];
-        memcpy(temp_buffer, data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
-    
-        // Then convert to float and copy to mic_buffers
-        for(int j = 0; j < AUDIO_BLOCK_SAMPLES; j++) {
-            mic_buffers[i][(blocks_collected * AUDIO_BLOCK_SAMPLES) + j] = (float)temp_buffer[j] / 32768.0f;
-        }
-
-        queues[i].freeBuffer();
+    for (int m = 0; m < NUM_MICS; m++) {
+      blocks[m] = queues[m].readBuffer();
+      if (!blocks[m]) {
+        all_blocks_valid = false;
+        break;
       }
     }
     
-    blocks_collected++;
-    
-    // Check if we've collected enough blocks for processing
-    if (blocks_collected >= (FFT_SIZE / AUDIO_BLOCK_SAMPLES)) {
-      Serial.println("Data read. Processing audio...");
-      process_audio();
-      blocks_collected = 0;  // Reset for next batch
+    if (all_blocks_valid) {
+      // Copy samples to buffer (keep as int16_t)
+      for (int m = 0; m < NUM_MICS; m++) {
+        int offset = i * AUDIO_BLOCK_SAMPLES;
+        memcpy(&mic_buffers[m][offset], blocks[m]->data, AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
+        queues[m].freeBuffer();
+      }  
     }
+    
+    blocks_collected++;
+  }
+  
+  // Check if we've collected enough blocks for processing
+  if (blocks_collected >= (FFT_SIZE / AUDIO_BLOCK_SAMPLES)) {
+    // Serial.println("Data read. Processing audio...");
+    process_audio();
+    blocks_collected = 0;  // Reset for next batch
   }
 }
 
 void process_audio() {
-  Serial.println("Applying window...");
-  // Apply window function to each microphone's buffer
+  // Debug: Print when we start processing
+  static int processCount = 0;
+  static float windowed_buffer[FFT_SIZE];
+  processCount++;
+  
+  // Calculate audio levels
+  float levels[NUM_MICS];
   for (int m = 0; m < NUM_MICS; m++) {
-    apply_window(mic_buffers[m], FFT_SIZE);
+    levels[m] = get_audio_level(mic_buffers[m], FFT_SIZE);
+    if (processCount % 10 == 0) { // Only print every 10th sample
+      Serial.print("Mic ");
+      Serial.print(m);
+      Serial.print(": ");
+      Serial.print(levels[m], 6);
+      Serial.print("\t");
+    }
+  }
+  if (processCount % 10 == 0) Serial.println();
+  
+  // Process each microphone
+  for (int m = 0; m < NUM_MICS; m++) {
+    // Apply window and convert to float in one step
+    apply_window(mic_buffers[m], windowed_buffer, FFT_SIZE);
     
+    // Compute FFT
+    compute_fft(windowed_buffer, mic_fft[m]);
+  }  
     // Debug: Check for NaN/Inf in windowed data
     for (int i = 0; i < FFT_SIZE; i++) {
       if (!isfinite(mic_buffers[m][i])) {
@@ -268,24 +306,33 @@ void process_audio() {
     }
   }
   
-  Serial.println("Computing FFTs...");
+  // Serial.println("Computing FFTs...");
   // Compute FFT for each microphone
   for (int m = 0; m < NUM_MICS; m++) {
     compute_fft(mic_buffers[m], mic_fft[m]);
   }
   
-  Serial.println("Computing SRP-PHAT...");
+  // Serial.println("Computing SRP-PHAT...");
   // Perform SRP-PHAT localization
   compute_srp_phat();
-  Serial.println("SRP-PHAT finished.");
+  // Serial.println("SRP-PHAT finished.");
 }
 
 void compute_srp_phat() {
+  // Check if we have enough signal
+  float ref_level = get_audio_level(mic_buffers[0], FFT_SIZE);
+  bool signal_ok = (ref_level > MIN_LEVEL);
+  
+  if (!signal_ok) {
+    Serial.println("No significant signal detected");
+    return;
+  }
+  
   float max_power = -1e12f;
   float best_x = 0, best_y = 0, best_z = 0;
-  
+    
   // Grid search over 3D space
-  for (int ix = 0; ix <= GRID_STEPS_X; ix++) {
+    for (int ix = 0; ix <= GRID_STEPS_X; ix++) {
     float x = GRID_MIN_X + ix * (GRID_MAX_X - GRID_MIN_X) / GRID_STEPS_X;
     
     for (int iy = 0; iy <= GRID_STEPS_Y; iy++) {
@@ -293,7 +340,7 @@ void compute_srp_phat() {
       
       for (int iz = 0; iz <= GRID_STEPS_Z; iz++) {
         float z = GRID_MIN_Z + iz * (GRID_MAX_Z - GRID_MIN_Z) / GRID_STEPS_Z;
-        
+
         float power = 0.0f;
         
         // For each microphone pair, calculate GCC-PHAT
