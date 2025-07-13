@@ -67,7 +67,7 @@ inline int gridToIndex(int ix, int iy, int iz) {
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial1.begin(115200);
   while (!Serial && millis() < 4000) {}
 
@@ -132,6 +132,37 @@ void loop() {
       // Serial.println("--- MUSIC algorithm completed ---\n");
     }
   }
+}
+
+void send_spectrum() {
+  // Send header with metadata
+  uint8_t header[20];
+  *((uint32_t*)(header + 0)) = 0x4D555349; // 'MUSI' as magic number
+  *((uint32_t*)(header + 4)) = GRID_X_STEPS;
+  *((uint32_t*)(header + 8)) = GRID_Y_STEPS;
+  *((uint32_t*)(header + 12)) = GRID_Z_STEPS;
+  *((float*)(header + 16)) = GRID_X_MIN;
+  *((float*)(header + 20)) = GRID_X_MAX;
+  *((float*)(header + 24)) = GRID_Y_MIN;
+  *((float*)(header + 28)) = GRID_Y_MAX;
+  *((float*)(header + 32)) = GRID_Z_MIN;
+  *((float*)(header + 36)) = GRID_Z_MAX;
+  
+  // Send header
+  Serial1.write(header, 40);
+  
+  // Send spectrum data in chunks to avoid buffer overflow
+  const int CHUNK_SIZE = 64; // Number of floats per chunk
+  int total_elements = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  
+  for (int i = 0; i < total_elements; i += CHUNK_SIZE) {
+    int chunk_size = min(CHUNK_SIZE, total_elements - i);
+    Serial1.write((uint8_t*)(music_spectrum + i), chunk_size * sizeof(float));
+  }
+  
+  // Send terminator
+  uint32_t terminator = 0xFFFFFFFF;
+  Serial1.write((uint8_t*)&terminator, 4);
 }
 
 void run_music_algorithm() {
@@ -285,4 +316,7 @@ void run_music_algorithm() {
     Serial1.print(", Z=");
     Serial1.println(est_z, 1);
   }
+  
+  // Send the complete spectrum data
+  send_spectrum();
 }

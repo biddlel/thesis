@@ -1,176 +1,204 @@
-#!/usr/bin/env python3
-import serial
-import serial.tools.list_ports
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for headless operation
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import serial
+import struct
 import time
 import os
-from flask import Flask, send_file, Response
-import io
-import threading
+from datetime import datetime
+
+# Use Agg backend for headless operation
+matplotlib.use('Agg')
 
 # Configuration
-SERIAL_BAUDRATE = 115200
-PLOT_UPDATE_INTERVAL = 0.1  # seconds
-PLOT_SIZE = (10, 8)  # inches
-PLOT_DPI = 100
-SERIAL_TIMEOUT = 1
+SERIAL_PORT = '/dev/ttyACM0'  # Update this to match your serial port
+BAUD_RATE = 115200
+OUTPUT_DIR = 'spectrum_plots'
+PLOT_INTERVAL = 1.0  # Seconds between plots
+MAX_PLOTS = 1000     # Maximum number of plots to keep
+LOG_FILE = 'spectrum_log.txt'  # Log file for recording detections
 
-# Initialize Flask app
-app = Flask(__name__)
+def log_message(message):
+    """Log messages with timestamp"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry)
+    with open(LOG_FILE, 'a') as f:
+        f.write(log_entry + '\n')
 
-# Global variables for data sharing between threads
-latest_position = (0, 0)
-plot_lock = threading.Lock()
-plot_img = None
-
-# Find and initialize serial port
-def init_serial():
-    # List all available ports
-    ports = list(serial.tools.list_ports.comports())
-    for p in ports:
-        print(f"Found port: {p.device} - {p.description}")
-        if 'ttyACM' in p.device or 'ttyUSB' in p.device:
-            try:
-                ser = serial.Serial(p.device, baudrate=SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
-                print(f"Connected to {p.device}")
-                return ser
-            except Exception as e:
-                print(f"Failed to open {p.device}: {e}")
-    raise Exception("No suitable serial port found")
-
-def parse_serial_data(line):
+def read_spectrum(ser):
+    """Read spectrum data from serial port"""
     try:
-        # Expected format: "Estimated Coords (mm): X=123.4, Y=567.8"
-        if line.startswith('Estimated Coords'):
-            parts = line.split()
-            x = float(parts[3].split('=')[1][:-1])  # Remove trailing comma
-            y = float(parts[4].split('=')[1])
-            return x, y
+        # Wait for magic number
+        magic = ser.read(4)
+        if len(magic) != 4 or magic != b'MUSI':
+            if magic:
+                log_message(f"Invalid magic: {magic.hex()}")
+            return None
+        
+        # Read rest of header
+        header = ser.read(36)
+        if len(header) != 36:
+            log_message("Incomplete header")
+            return None
+        
+        # Parse header
+        x_steps = int.from_bytes(header[0:4], 'little')
+        y_steps = int.from_bytes(header[4:8], 'little')
+        z_steps = int.from_bytes(header[8:12], 'little')
+        x_min = struct.unpack('<f', header[12:16])[0]
+        x_max = struct.unpack('<f', header[16:20])[0]
+        y_min = struct.unpack('<f', header[20:24])[0]
+        y_max = struct.unpack('<f', header[24:28])[0]
+        z_min = struct.unpack('<f', header[28:32])[0]
+        z_max = struct.unpack('<f', header[32:36])[0]
+        
+        total_points = x_steps * y_steps * z_steps
+        data = bytearray()
+        
+        # Read spectrum data
+        while len(data) < total_points * 4:
+            chunk = ser.read(min(1024, total_points * 4 - len(data)))
+            if not chunk:
+                log_message("Incomplete data")
+                return None
+            data.extend(chunk)
+        
+        # Read terminator
+        terminator = ser.read(4)
+        if terminator != b'\xFF\xFF\xFF\xFF':
+            log_message("Invalid terminator")
+            return None
+        
+        # Convert to numpy array and reshape
+        spectrum = np.frombuffer(data, dtype=np.float32).reshape((x_steps, y_steps, z_steps))
+        
+        return {
+            'spectrum': spectrum,
+            'x': np.linspace(x_min, x_max, x_steps),
+            'y': np.linspace(y_min, y_max, y_steps),
+            'z': np.linspace(z_min, z_max, z_steps),
+            'timestamp': datetime.now()
+        }
     except Exception as e:
-        print(f"Error parsing line: {e}")
-    return None
+        log_message(f"Error reading spectrum: {e}")
+        return None
 
-def update_plot(x, y):
-    global plot_img
-    
-    plt.figure(figsize=PLOT_SIZE, dpi=PLOT_DPI)
-    
-    # Create a grid
-    x_range = np.linspace(-500, 500, 100)
-    y_range = np.linspace(-500, 500, 100)
-    X, Y = np.meshgrid(x_range, y_range)
-    
-    # Create a simple plot with the point
-    plt.scatter([x], [y], c='red', s=200, zorder=5, label='Sound Source')
-    plt.scatter([0], [0], c='blue', s=100, marker='s', label='Microphone Array')
-    
-    # Add grid and labels
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.axhline(0, color='black', linewidth=0.5)
-    plt.axvline(0, color='black', linewidth=0.5)
-    plt.title('Sound Source Localization')
-    plt.xlabel('X Position (mm)')
-    plt.ylabel('Y Position (mm)')
-    plt.xlim(-600, 600)
-    plt.ylim(-600, 600)
-    plt.legend()
-    
-    # Add crosshairs at the current position
-    plt.axvline(x, color='red', linestyle='--', alpha=0.3)
-    plt.axhline(y, color='red', linestyle='--', alpha=0.3)
-    
-    # Save plot to a bytes buffer
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    
-    with plot_lock:
-        plot_img = buf.read()
-    
-    plt.close()
+def plot_spectrum(spectrum_data, output_dir, plot_number):
+    """Create and save spectrum plot"""
+    try:
+        # Find slice with maximum power
+        max_z_idx = np.argmax(np.max(spectrum_data['spectrum'], axis=(0, 1)))
+        z_value = spectrum_data['z'][max_z_idx]
+        
+        # Create figure
+        plt.figure(figsize=(10, 8))
+        
+        # Plot XY slice at max Z
+        plt.imshow(spectrum_data['spectrum'][:, :, max_z_idx].T,
+                  extent=[spectrum_data['x'][0], spectrum_data['x'][-1],
+                          spectrum_data['y'][0], spectrum_data['y'][-1]],
+                  origin='lower', aspect='auto', cmap='viridis')
+        
+        plt.colorbar(label='Power (dB)')
+        plt.xlabel('X Position (mm)')
+        plt.ylabel('Y Position (mm)')
+        plt.title(f'Sound Source Localization (Z = {z_value:.1f} mm)')
+        
+        # Add timestamp
+        timestamp = spectrum_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+        plt.figtext(0.5, 0.01, f'Last Update: {timestamp}', 
+                    ha='center', fontsize=8, style='italic')
+        
+        # Save figure
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f'spectrum_{plot_number:04d}.png')
+        plt.savefig(output_path, bbox_inches='tight', dpi=100)
+        plt.close()
+        
+        # Create a symlink to the latest plot
+        latest_path = os.path.join(output_dir, 'latest.png')
+        if os.path.lexists(latest_path):
+            os.remove(latest_path)
+        os.symlink(os.path.basename(output_path), latest_path)
+        
+        return output_path
+    except Exception as e:
+        log_message(f"Error creating plot: {e}")
+        return None
 
-# Background thread to read from serial and update plot
-def serial_reader():
-    global latest_position
-    
-    ser = None
-    while True:
-        try:
-            if ser is None:
-                ser = init_serial()
-            
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()
-                if line:
-                    result = parse_serial_data(line)
-                    if result:
-                        x, y = result
-                        latest_position = (x, y)
-                        print(f"Updated position: X={x:.1f}, Y={y:.1f}")
-                        update_plot(x, y)
-        except Exception as e:
-            print(f"Serial error: {e}")
-            if ser:
-                ser.close()
-                ser = None
-            time.sleep(2)  # Wait before retrying
-        time.sleep(0.01)  # Small delay to prevent busy waiting
-
-# Flask routes
-@app.route('/')
-def index():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Sound Source Localization</title>
-        <meta http-equiv="refresh" content="0.5">
-        <style>
-            body { font-family: Arial, sans-serif; text-align: center; }
-            img { max-width: 90%; height: auto; border: 1px solid #ddd; }
-            .container { margin: 20px; }
-            .coords { 
-                font-size: 1.5em; 
-                margin: 20px 0; 
-                padding: 10px; 
-                background-color: #f0f0f0; 
-                display: inline-block;
-                border-radius: 5px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Sound Source Localization</h1>
-            <div class="coords">
-                Latest position: X={x:.1f}mm, Y={y:.1f}mm
-            </div>
-            <div>
-                <img src="/plot" alt="Sound source position">
-            </div>
-        </div>
-    </body>
-    </html>
-    """.format(x=latest_position[0], y=latest_position[1])
-
-@app.route('/plot')
-def plot():
-    with plot_lock:
-        if plot_img is None:
-            return "No plot available yet", 404
-        return Response(plot_img, mimetype='image/png')
+def cleanup_old_plots(output_dir, max_plots):
+    """Remove old plot files to save disk space"""
+    try:
+        # Get all plot files
+        plot_files = [f for f in os.listdir(output_dir) if f.startswith('spectrum_') and f.endswith('.png')]
+        plot_files.sort()
+        
+        # Remove oldest files if we have too many
+        while len(plot_files) > max_plots:
+            oldest = plot_files.pop(0)
+            os.remove(os.path.join(output_dir, oldest))
+            log_message(f"Removed old plot: {oldest}")
+    except Exception as e:
+        log_message(f"Error cleaning up old plots: {e}")
 
 def main():
-    # Start serial reader thread
-    serial_thread = threading.Thread(target=serial_reader, daemon=True)
-    serial_thread.start()
+    log_message("Starting spectrum visualizer")
+    log_message(f"Output directory: {os.path.abspath(OUTPUT_DIR)}")
+    log_message("Press Ctrl+C to stop")
     
-    # Start Flask web server
-    print("Starting web server at http://0.0.0.0:5000/")
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    try:
+        # Open serial connection
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1.0)
+        log_message(f"Connected to {ser.name}")
+        
+        plot_number = 0
+        last_plot_time = 0
+        last_log_time = time.time()
+        
+        while True:
+            current_time = time.time()
+            
+            # Read data from serial
+            spectrum_data = read_spectrum(ser)
+            
+            # If we have valid data and enough time has passed, create a plot
+            if spectrum_data and (current_time - last_plot_time) >= PLOT_INTERVAL:
+                plot_path = plot_spectrum(spectrum_data, OUTPUT_DIR, plot_number)
+                if plot_path:
+                    log_message(f"Saved plot: {plot_path}")
+                    
+                    # Log peak position
+                    max_idx = np.unravel_index(np.argmax(spectrum_data['spectrum']), 
+                                             spectrum_data['spectrum'].shape)
+                    x_pos = spectrum_data['x'][max_idx[0]]
+                    y_pos = spectrum_data['y'][max_idx[1]]
+                    z_pos = spectrum_data['z'][max_idx[2]]
+                    log_message(f"Peak at: X={x_pos:.1f}mm, Y={y_pos:.1f}mm, Z={z_pos:.1f}mm")
+                
+                # Clean up old plots periodically
+                if plot_number % 10 == 0:
+                    cleanup_old_plots(OUTPUT_DIR, MAX_PLOTS)
+                
+                plot_number += 1
+                last_plot_time = current_time
+            
+            # Periodic status update
+            if current_time - last_log_time > 60:  # Every minute
+                log_message(f"Still running... {plot_number} plots saved")
+                last_log_time = current_time
+                
+    except serial.SerialException as e:
+        log_message(f"Serial port error: {e}")
+    except KeyboardInterrupt:
+        log_message("Stopped by user")
+    except Exception as e:
+        log_message(f"Unexpected error: {e}")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
+            log_message("Serial port closed")
+        log_message("Spectrum visualizer stopped")
 
 if __name__ == "__main__":
     main()
