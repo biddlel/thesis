@@ -134,35 +134,129 @@ void loop() {
   }
 }
 
-void send_spectrum() {
-  // Send header with metadata
-  uint8_t header[20];
-  *((uint32_t*)(header + 0)) = 0x4D555349; // 'MUSI' as magic number
-  *((uint32_t*)(header + 4)) = GRID_X_STEPS;
-  *((uint32_t*)(header + 8)) = GRID_Y_STEPS;
-  *((uint32_t*)(header + 12)) = GRID_Z_STEPS;
-  *((float*)(header + 16)) = GRID_X_MIN;
-  *((float*)(header + 20)) = GRID_X_MAX;
-  *((float*)(header + 24)) = GRID_Y_MIN;
-  *((float*)(header + 28)) = GRID_Y_MAX;
-  *((float*)(header + 32)) = GRID_Z_MIN;
-  *((float*)(header + 36)) = GRID_Z_MAX;
+
+struct SpectrumHeader {
+  uint32_t magic;         // 'MUSI' as 32-bit value
+  uint32_t x_steps;       // Number of steps in X dimension
+  uint32_t y_steps;       // Number of steps in Y dimension
+  uint32_t z_steps;       // Number of steps in Z dimension
+  float x_min, x_max;     // X dimension bounds
+  float y_min, y_max;     // Y dimension bounds
+  float z_min, z_max;     // Z dimension bounds
+  uint32_t data_size;     // Total number of floats in the spectrum data
+  uint32_t checksum;      // Simple checksum of the header
+};
+
+// Calculate a simple checksum for the header
+uint32_t calculate_checksum(const uint8_t* data, size_t length) {
+  uint32_t sum = 0;
+  for (size_t i = 0; i < length; i++) {
+      sum += data[i];
+  }
+  return sum;
+}
+
+bool send_spectrum() {
+  // 1. Prepare the header
+  SpectrumHeader header;
+  header.magic = 0x4D555349;  // 'MUSI' in ASCII
+  header.x_steps = GRID_X_STEPS;
+  header.y_steps = GRID_Y_STEPS;
+  header.z_steps = GRID_Z_STEPS;
+  header.x_min = GRID_X_MIN;
+  header.x_max = GRID_X_MAX;
+  header.y_min = GRID_Y_MIN;
+  header.y_max = GRID_Y_MAX;
+  header.z_min = GRID_Z_MIN;
+  header.z_max = GRID_Z_MAX;
+  header.data_size = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
   
-  // Send header
-  Serial1.write(header, 40);
+  // Calculate checksum (excluding the checksum field itself)
+  header.checksum = 0;
+  uint32_t checksum = calculate_checksum(
+      reinterpret_cast<const uint8_t*>(&header), 
+      sizeof(header) - sizeof(header.checksum)
+  );
+  header.checksum = checksum;
   
-  // Send spectrum data in chunks to avoid buffer overflow
-  const int CHUNK_SIZE = 64; // Number of floats per chunk
-  int total_elements = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  // 2. Send the header
+  size_t header_size = sizeof(header);
+  const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header);
   
-  for (int i = 0; i < total_elements; i += CHUNK_SIZE) {
-    int chunk_size = min(CHUNK_SIZE, total_elements - i);
-    Serial1.write((uint8_t*)(music_spectrum + i), chunk_size * sizeof(float));
+  // Write header in chunks if needed
+  size_t header_sent = 0;
+  while (header_sent < header_size) {
+      size_t chunk_size = min(64, static_cast<int>(header_size - header_sent));
+      size_t written = Serial1.write(header_bytes + header_sent, chunk_size);
+      
+      if (written == 0) {
+          // Write failed
+          return false;
+      }
+      
+      header_sent += written;
   }
   
-  // Send terminator
-  uint32_t terminator = 0xFFFFFFFF;
-  Serial1.write((uint8_t*)&terminator, 4);
+  // 3. Send the spectrum data in chunks
+  const size_t CHUNK_SIZE = 32;  // Number of floats per chunk
+  const size_t FLOAT_SIZE = sizeof(float);
+  const size_t CHUNK_BYTES = CHUNK_SIZE * FLOAT_SIZE;
+  
+  size_t total_floats = header.data_size;
+  size_t floats_sent = 0;
+  
+  while (floats_sent < total_floats) {
+      size_t remaining_floats = total_floats - floats_sent;
+      size_t chunk_floats = min(CHUNK_SIZE, remaining_floats);
+      size_t chunk_bytes = chunk_floats * FLOAT_SIZE;
+      
+      // Get pointer to the current chunk of data
+      const uint8_t* chunk_ptr = reinterpret_cast<const uint8_t*>(
+          music_spectrum + floats_sent
+      );
+      
+      // Send the chunk
+      size_t bytes_sent = 0;
+      while (bytes_sent < chunk_bytes) {
+          size_t written = Serial1.write(
+              chunk_ptr + bytes_sent, 
+              chunk_bytes - bytes_sent
+          );
+          
+          if (written == 0) {
+              // Write failed
+              return false;
+          }
+          
+          bytes_sent += written;
+      }
+      
+      floats_sent += chunk_floats;
+  }
+  
+  // 4. Send end marker
+  const uint32_t END_MARKER = 0xFFFFFFFF;
+  size_t marker_sent = 0;
+  const uint8_t* marker_ptr = reinterpret_cast<const uint8_t*>(&END_MARKER);
+  
+  while (marker_sent < sizeof(END_MARKER)) {
+      size_t written = Serial1.write(
+          marker_ptr + marker_sent, 
+          sizeof(END_MARKER) - marker_sent
+      );
+      
+      if (written == 0) {
+          // Write failed
+          return false;
+      }
+      
+      marker_sent += written;
+  }
+  
+  // Flush to ensure all data is sent
+  Serial1.flush();
+  
+  return true;
 }
 
 void run_music_algorithm() {

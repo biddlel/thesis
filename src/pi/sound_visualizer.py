@@ -1,22 +1,34 @@
 import numpy as np
 import matplotlib
+matplotlib.use('Agg')  # For headless operation
 import matplotlib.pyplot as plt
 import serial
 import struct
-import time
 import os
+import time
 from datetime import datetime
 
-# Use Agg backend for headless operation
-matplotlib.use('Agg')
-
 # Configuration
-SERIAL_PORT = '/dev/ttyACM0'  # Update this to match your serial port
+SERIAL_PORT = '/dev/ttyACM0'  # Update this to your serial port
 BAUD_RATE = 115200
 OUTPUT_DIR = 'spectrum_plots'
-PLOT_INTERVAL = 1.0  # Seconds between plots
-MAX_PLOTS = 1000     # Maximum number of plots to keep
-LOG_FILE = 'spectrum_log.txt'  # Log file for recording detections
+LOG_FILE = 'spectrum_log.txt'
+PLOT_INTERVAL = 1.0  # Minimum seconds between plots
+MAX_PLOTS = 1000
+
+# Structure for the header (must match the C++ struct)
+class SpectrumHeader:
+    def __init__(self, data):
+        (self.magic,
+         self.x_steps, self.y_steps, self.z_steps,
+         self.x_min, self.x_max,
+         self.y_min, self.y_max,
+         self.z_min, self.z_max,
+         self.data_size,
+         self.checksum) = struct.unpack('<IIIIfffffIII', data)
+    
+    def calculate_checksum(self, data):
+        return sum(data[:40])  # Sum of first 40 bytes (before checksum)
 
 def log_message(message):
     """Log messages with timestamp"""
@@ -27,65 +39,63 @@ def log_message(message):
         f.write(log_entry + '\n')
 
 def read_spectrum(ser):
-    """Read spectrum data from serial port"""
+    """Read a complete spectrum data packet"""
     try:
-        # Wait for magic number
-        magic = ser.read(4)
-        if len(magic) != 4 or magic != b'MUSI':
-            if magic:
-                log_message(f"Invalid magic: {magic.hex()}")
+        # Read header (44 bytes: 4 + 3*4 + 6*4 + 4 + 4)
+        header_data = ser.read(44)
+        if len(header_data) != 44:
+            return None
+            
+        header = SpectrumHeader(header_data)
+        
+        # Verify magic number
+        if header.magic != 0x4D555349:  # 'MUSI'
+            log_message(f"Invalid magic number: {hex(header.magic)}")
+            return None
+            
+        # Verify checksum
+        if header.calculate_checksum(header_data) != header.checksum:
+            log_message("Checksum verification failed")
             return None
         
-        # Read rest of header
-        header = ser.read(36)
-        if len(header) != 36:
-            log_message("Incomplete header")
-            return None
-        
-        # Parse header
-        x_steps = int.from_bytes(header[0:4], 'little')
-        y_steps = int.from_bytes(header[4:8], 'little')
-        z_steps = int.from_bytes(header[8:12], 'little')
-        x_min = struct.unpack('<f', header[12:16])[0]
-        x_max = struct.unpack('<f', header[16:20])[0]
-        y_min = struct.unpack('<f', header[20:24])[0]
-        y_max = struct.unpack('<f', header[24:28])[0]
-        z_min = struct.unpack('<f', header[28:32])[0]
-        z_max = struct.unpack('<f', header[32:36])[0]
-        
-        total_points = x_steps * y_steps * z_steps
+        # Calculate total data size
+        total_bytes = header.data_size * 4  # 4 bytes per float
         data = bytearray()
         
-        # Read spectrum data
-        while len(data) < total_points * 4:
-            chunk = ser.read(min(1024, total_points * 4 - len(data)))
+        # Read data in chunks
+        while len(data) < total_bytes:
+            chunk = ser.read(min(1024, total_bytes - len(data)))
             if not chunk:
                 log_message("Incomplete data")
                 return None
             data.extend(chunk)
         
-        # Read terminator
-        terminator = ser.read(4)
-        if terminator != b'\xFF\xFF\xFF\xFF':
-            log_message("Invalid terminator")
+        # Read end marker
+        end_marker = ser.read(4)
+        if len(end_marker) != 4 or end_marker != b'\xFF\xFF\xFF\xFF':
+            log_message("Invalid end marker")
             return None
         
-        # Convert to numpy array and reshape
-        spectrum = np.frombuffer(data, dtype=np.float32).reshape((x_steps, y_steps, z_steps))
+        # Convert to numpy array
+        spectrum = np.frombuffer(data, dtype=np.float32)
+        
+        # Reshape to 3D grid
+        spectrum = spectrum.reshape((header.x_steps, header.y_steps, header.z_steps))
         
         return {
             'spectrum': spectrum,
-            'x': np.linspace(x_min, x_max, x_steps),
-            'y': np.linspace(y_min, y_max, y_steps),
-            'z': np.linspace(z_min, z_max, z_steps),
+            'x': np.linspace(header.x_min, header.x_max, header.x_steps),
+            'y': np.linspace(header.y_min, header.y_max, header.y_steps),
+            'z': np.linspace(header.z_min, header.z_max, header.z_steps),
             'timestamp': datetime.now()
         }
+        
     except Exception as e:
         log_message(f"Error reading spectrum: {e}")
         return None
 
 def plot_spectrum(spectrum_data, output_dir, plot_number):
-    """Create and save spectrum plot"""
+    """Create and save a visualization of the spectrum"""
     try:
         # Find slice with maximum power
         max_z_idx = np.argmax(np.max(spectrum_data['spectrum'], axis=(0, 1)))
@@ -108,7 +118,7 @@ def plot_spectrum(spectrum_data, output_dir, plot_number):
         # Add timestamp
         timestamp = spectrum_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
         plt.figtext(0.5, 0.01, f'Last Update: {timestamp}', 
-                    ha='center', fontsize=8, style='italic')
+                   ha='center', fontsize=8, style='italic')
         
         # Save figure
         os.makedirs(output_dir, exist_ok=True)
@@ -116,13 +126,14 @@ def plot_spectrum(spectrum_data, output_dir, plot_number):
         plt.savefig(output_path, bbox_inches='tight', dpi=100)
         plt.close()
         
-        # Create a symlink to the latest plot
+        # Create/update symlink to latest plot
         latest_path = os.path.join(output_dir, 'latest.png')
         if os.path.lexists(latest_path):
             os.remove(latest_path)
         os.symlink(os.path.basename(output_path), latest_path)
         
         return output_path
+        
     except Exception as e:
         log_message(f"Error creating plot: {e}")
         return None
@@ -130,8 +141,12 @@ def plot_spectrum(spectrum_data, output_dir, plot_number):
 def cleanup_old_plots(output_dir, max_plots):
     """Remove old plot files to save disk space"""
     try:
+        if not os.path.exists(output_dir):
+            return
+            
         # Get all plot files
-        plot_files = [f for f in os.listdir(output_dir) if f.startswith('spectrum_') and f.endswith('.png')]
+        plot_files = [f for f in os.listdir(output_dir) 
+                     if f.startswith('spectrum_') and f.endswith('.png')]
         plot_files.sort()
         
         # Remove oldest files if we have too many
@@ -139,6 +154,7 @@ def cleanup_old_plots(output_dir, max_plots):
             oldest = plot_files.pop(0)
             os.remove(os.path.join(output_dir, oldest))
             log_message(f"Removed old plot: {oldest}")
+            
     except Exception as e:
         log_message(f"Error cleaning up old plots: {e}")
 
