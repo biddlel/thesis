@@ -1,0 +1,7 @@
+pyserial>=3.5
+matplotlib>=3.4.0
+flask>=2.0.0
+numpy>=1.21.0
+opencv-python-headless>=4.5.0
+picamera2>=0.3.0
+Pillow>=9.0.0
