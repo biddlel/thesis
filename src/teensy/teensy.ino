@@ -157,6 +157,13 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
   return sum;
 }
 
+// Binary message header
+struct MessageHeader {
+  uint32_t magic;      // Magic number to identify the start of a message
+  uint32_t length;     // Length of the JSON data
+  uint32_t checksum;   // Simple checksum of the JSON data
+};
+
 bool send_spectrum() {
   // Create a JSON document
   JsonDocument doc;
@@ -191,14 +198,40 @@ bool send_spectrum() {
   String json_string;
   serializeJson(doc, json_string);
   
-  // Add message separator (double newline)
-  json_string += "\n\n";
+  // Calculate checksum
+  uint32_t checksum = 0;
+  for (size_t i = 0; i < json_string.length(); i++) {
+    checksum += (uint8_t)json_string[i];
+  }
   
-  // Send the JSON string over serial
-  size_t bytes_sent = Serial1.print(json_string);
+  // Prepare message header
+  MessageHeader header;
+  header.magic = 0x4A534F4E;  // 'JSON' in ASCII
+  header.length = json_string.length();
+  header.checksum = checksum;
   
-  // Return true if all bytes were sent successfully
-  return (bytes_sent == json_string.length());
+  // Send header
+  Serial1.write((const uint8_t*)&header, sizeof(header));
+  
+  // Send JSON data
+  size_t bytes_written = 0;
+  const char* json_data = json_string.c_str();
+  
+  // Write in chunks to avoid blocking
+  while (bytes_written < header.length) {
+    size_t chunk_size = min(64, (int)(header.length - bytes_written));
+    size_t written = Serial1.write(json_data + bytes_written, chunk_size);
+    if (written == 0) {
+      // Write failed
+      return false;
+    }
+    bytes_written += written;
+  }
+  
+  // Send a newline for good measure (optional)
+  Serial1.write('\n');
+  
+  return true;
 }
 
 void run_music_algorithm() {

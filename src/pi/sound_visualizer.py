@@ -6,10 +6,12 @@ import serial
 import json
 import os
 import time
+import glob
+import serial.tools.list_ports
 from datetime import datetime
 
 # Configuration
-SERIAL_PORT = '/dev/ttyAMA0'  # Update this to your serial port
+SERIAL_PORTS = ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0', '/dev/ttyAMA0']  # Common ports for Teensy
 BAUD_RATE = 115200
 OUTPUT_DIR = 'spectrum_plots'
 LOG_FILE = 'spectrum_log.txt'
@@ -21,6 +23,31 @@ MESSAGE_SEPARATOR = b'\n\n'  # Double newline to separate JSON messages
 
 # Track if we've logged before in this session
 _first_log = True
+
+# Binary message header format
+class MessageHeader:
+    STRUCT_FORMAT = '<III'  # Little-endian, 3 unsigned ints (magic, length, checksum)
+    SIZE = 12  # 3 * 4 bytes
+    MAGIC = 0x4A534F4E  # 'JSON' in ASCII
+
+def find_teensy_port():
+    """Try to find the Teensy by checking common ports or listing all available"""
+    # First check common ports
+    for port in SERIAL_PORTS:
+        if os.path.exists(port):
+            log_message(f"Found potential Teensy at {port}")
+            return port
+    
+    # If not found, list all available ports
+    log_message("Teensy not found in common ports. Available ports:")
+    ports = list(serial.tools.list_ports.comports())
+    for port in ports:
+        log_message(f"  {port.device} - {port.description}")
+    
+    if ports:
+        return ports[0].device
+    
+    return None
 
 def log_message(message):
     """Log messages with timestamp"""
@@ -52,35 +79,97 @@ def find_magic(ser):
     return False, None
 
 def read_json_message(ser, timeout=5.0):
-    """Read a complete JSON message from serial"""
-    start_time = time.time()
-    buffer = bytearray()
+    """Read a complete JSON message using binary protocol"""
+    import struct
     
-    while True:
+    start_time = time.time()
+    header_data = bytearray()
+    
+    log_message("Waiting for message header...")
+    
+    # Read header
+    while len(header_data) < MessageHeader.SIZE:
         if time.time() - start_time > timeout:
-            log_message("Timeout waiting for message")
+            log_message("Timeout waiting for message header")
             return None
             
         if ser.in_waiting > 0:
             chunk = ser.read(ser.in_waiting)
-            buffer += chunk
-            
-            # Look for message separator
-            if MESSAGE_SEPARATOR in buffer:
-                message_end = buffer.find(MESSAGE_SEPARATOR)
-                message = buffer[:message_end].decode('utf-8', errors='ignore')
-                buffer = buffer[message_end + len(MESSAGE_SEPARATOR):]
-                
-                try:
-                    data = json.loads(message)
-                    log_message("Successfully parsed JSON message")
-                    return data
-                except json.JSONDecodeError as e:
-                    log_message(f"JSON decode error: {e}")
-                    log_message(f"Message content: {message[:200]}...")  # Log first 200 chars
-                    continue
+            header_data.extend(chunk)
+            log_message(f"Read {len(chunk)} bytes of header data")
         else:
-            time.sleep(0.01)  # Small delay to prevent busy waiting
+            time.sleep(0.01)
+    
+    # Parse header
+    try:
+        magic, length, checksum = struct.unpack(MessageHeader.STRUCT_FORMAT, header_data[:MessageHeader.SIZE])
+    except struct.error as e:
+        log_message(f"Error parsing header: {e}")
+        log_message(f"Header bytes: {header_data[:MessageHeader.SIZE].hex()}")
+        return None
+    
+    if magic != MessageHeader.MAGIC:
+        log_message(f"Invalid magic number: 0x{magic:08X} (expected 0x{MessageHeader.MAGIC:08X})")
+        return None
+    
+    log_message(f"Message header: length={length}, checksum=0x{checksum:08X}")
+    
+    # Read JSON data
+    data = bytearray()
+    bytes_read = 0
+    
+    log_message(f"Reading {length} bytes of JSON data...")
+    
+    while bytes_read < length:
+        if time.time() - start_time > timeout:
+            log_message(f"Timeout reading JSON data (got {bytes_read}/{length} bytes)")
+            return None
+            
+        if ser.in_waiting > 0:
+            chunk = ser.read(min(ser.in_waiting, length - bytes_read))
+            data.extend(chunk)
+            bytes_read += len(chunk)
+            log_message(f"Read {len(chunk)} bytes of JSON data ({bytes_read}/{length} total)")
+        else:
+            time.sleep(0.01)
+    
+    # Verify checksum
+    calculated_checksum = sum(data)
+    if calculated_checksum != checksum:
+        log_message(f"Checksum mismatch: expected 0x{checksum:08X}, got 0x{calculated_checksum:08X}")
+        return None
+    
+    # Try to parse JSON
+    try:
+        json_str = data.decode('utf-8')
+        log_message("Successfully decoded JSON string")
+        log_message(f"JSON length: {len(json_str)} characters")
+        
+        # Parse the JSON
+        result = json.loads(json_str)
+        log_message("Successfully parsed JSON message")
+        
+        # Log some basic info about the data
+        if isinstance(result, dict):
+            log_message(f"Message keys: {list(result.keys())}")
+            if 'spectrum_data' in result and isinstance(result['spectrum_data'], list):
+                log_message(f"Spectrum data length: {len(result['spectrum_data'])}")
+                if len(result['spectrum_data']) > 0:
+                    log_message(f"First value: {result['spectrum_data'][0]}")
+        
+        return result
+        
+    except UnicodeDecodeError as e:
+        log_message(f"Failed to decode JSON as UTF-8: {e}")
+        log_message(f"First 100 bytes (hex): {data[:100].hex()}")
+        return None
+    except json.JSONDecodeError as e:
+        log_message(f"Failed to parse JSON: {e}")
+        log_message(f"JSON content (first 200 chars): {data[:200].decode('utf-8', errors='replace')}")
+        return None
+    except Exception as e:
+        log_message(f"Unexpected error: {e}")
+        return None
 
 def read_spectrum(ser):
     """Read a complete spectrum data packet in JSON format"""
@@ -127,10 +216,6 @@ def read_spectrum(ser):
             
     except Exception as e:
         log_message(f"Error in read_spectrum: {e}")
-        return None
-
-    except Exception as e:
-        log_message(f"Error reading spectrum: {e}")
         return None
 
 def plot_spectrum(spectrum_data, output_dir, plot_number):
@@ -200,12 +285,42 @@ def cleanup_old_plots(output_dir, max_plots):
 def main():
     log_message("Starting spectrum visualizer")
     log_message(f"Output directory: {os.path.abspath(OUTPUT_DIR)}")
-    log_message("Press Ctrl+C to stop")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Find and open serial connection to Teensy
+    port = find_teensy_port()
+    if not port:
+        log_message("Error: Could not find Teensy. Please check the connection.")
+        return
+        
+    log_message(f"Found Teensy at {port}, connecting at {BAUD_RATE} baud...")
     
     try:
-        # Open serial connection
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1.0)
+        # Open serial connection with explicit timeout and buffer settings
+        ser = serial.Serial(
+            port=port,
+            baudrate=BAUD_RATE,
+            timeout=1.0,  # Shorter timeout for faster response
+            write_timeout=1.0,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False
+        )
+        
+        # Give the connection a moment to establish
+        time.sleep(2)
+        
+        # Flush any existing data in the input buffer
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        
         log_message(f"Connected to {ser.name}")
+        log_message("Waiting for data from Teensy...")
         
         plot_number = 0
         last_plot_time = 0
