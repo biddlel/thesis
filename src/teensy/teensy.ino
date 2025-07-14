@@ -5,6 +5,11 @@
 #include <ArduinoJson.h>
 #include <MsgPack.h>
 
+// Disable debug logging to reduce noise
+#ifndef DEBUGLOG_DEFAULT_LOG_LEVEL
+#define DEBUGLOG_DEFAULT_LOG_LEVEL 0
+#endif
+
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
 const int FFT_SIZE = 1024;
@@ -147,7 +152,7 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 
 // MessagePack buffer
 const size_t MSGPACK_BUFFER_SIZE = 8192;  // Increased buffer size for safety
-StaticJsonDocument<MSGPACK_BUFFER_SIZE> doc;
+ArduinoJson::StaticJsonDocument<MSGPACK_BUFFER_SIZE> doc;
 MsgPack::Packer packer;
 
 // Calculate checksum of the spectrum data
@@ -162,11 +167,22 @@ uint32_t calculate_checksum(float* spectrum_data, size_t data_size,
     sum += data[i];
   }
   
-  // Add other fields to the checksum
+  // Add other fields to the checksum using memcpy to avoid type-punning
   sum += x_steps ^ y_steps ^ z_steps;
-  sum += *((uint32_t*)&x_min) + *((uint32_t*)&x_max);
-  sum += *((uint32_t*)&y_min) + *((uint32_t*)&y_max);
-  sum += *((uint32_t*)&z_min) + *((uint32_t*)&z_max);
+  
+  uint32_t bits;
+  memcpy(&bits, &x_min, sizeof(x_min));
+  sum += bits;
+  memcpy(&bits, &x_max, sizeof(x_max));
+  sum += bits;
+  memcpy(&bits, &y_min, sizeof(y_min));
+  sum += bits;
+  memcpy(&bits, &y_max, sizeof(y_max));
+  sum += bits;
+  memcpy(&bits, &z_min, sizeof(z_min));
+  sum += bits;
+  memcpy(&bits, &z_max, sizeof(z_max));
+  sum += bits;
   
   return sum;
 }
@@ -200,8 +216,8 @@ bool send_spectrum() {
   root["z_max"] = GRID_Z_MAX;
   root["checksum"] = checksum;
   
-  // Add spectrum data as an array
-  JsonArray spectrum_array = root.createNestedArray("spectrum_data");
+  // Add spectrum data as an array using modern API
+  JsonArray spectrum_array = root["spectrum_data"].to<JsonArray>();
   for (int i = 0; i < total_points; i++) {
     int x = i % GRID_X_STEPS;
     int y = (i / GRID_X_STEPS) % GRID_Y_STEPS;
