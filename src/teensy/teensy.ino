@@ -2,6 +2,7 @@
 #include <arm_math.h>
 #include "linalg.h"
 #include "AudioFilterSPH0645.h"
+#include <ArduinoJson.h>
 #include <MsgPack.h>
 
 // --- Configuration Constants ---
@@ -147,6 +148,7 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 // MessagePack buffer
 const size_t MSGPACK_BUFFER_SIZE = 8192;  // Increased buffer size for safety
 StaticJsonDocument<MSGPACK_BUFFER_SIZE> doc;
+MsgPack::Packer packer;
 
 // Calculate checksum of the spectrum data
 uint32_t calculate_checksum(float* spectrum_data, size_t data_size,
@@ -208,21 +210,16 @@ bool send_spectrum() {
     spectrum_array.add(music_spectrum[idx]);
   }
   
-  // Serialize to MessagePack
-  size_t len = measureMsgPack(doc);
-  if (len > MSGPACK_BUFFER_SIZE) {
-    return false;  // Not enough space in buffer
-  }
+  // Clear and serialize to MessagePack
+  packer.clear();
+  packer.serialize(doc);
   
-  uint8_t msgpack_buffer[MSGPACK_BUFFER_SIZE];
-  size_t actual_len = serializeMsgPack(doc, msgpack_buffer, MSGPACK_BUFFER_SIZE);
-  
-  if (actual_len == 0) {
+  if (packer.size() == 0) {
     return false;  // Serialization failed
   }
   
   // First send the message length (4 bytes, big-endian)
-  uint32_t msg_len = len;
+  uint32_t msg_len = packer.size();
   uint8_t len_bytes[4];
   len_bytes[0] = (msg_len >> 24) & 0xFF;
   len_bytes[1] = (msg_len >> 16) & 0xFF;
@@ -233,9 +230,9 @@ bool send_spectrum() {
   
   // Then send the MessagePack data in chunks to avoid blocking
   size_t bytes_written = 0;
-  while (bytes_written < len) {
-    size_t chunk_size = min(64, (int)(len - bytes_written));
-    size_t written = Serial1.write(msgpack_buffer + bytes_written, chunk_size);
+  while (bytes_written < packer.size()) {
+    size_t chunk_size = min(64, (int)(packer.size() - bytes_written));
+    size_t written = Serial1.write(packer.data() + bytes_written, chunk_size);
     if (written == 0) {
       // Write failed
       return false;
