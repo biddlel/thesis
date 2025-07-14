@@ -225,8 +225,9 @@ bool send_spectrum() {
     // Calculate and set checksum
     spectrum_msg.checksum = calculate_checksum(spectrum_msg);
     
-    // Encode the message using MsgPacketizer
-    const auto& packet = MsgPacketizer::encode(0,  // packet ID
+    // Encode the spectrum data using MsgPacketizer
+    const auto& packet = MsgPacketizer::encode(
+        0,  // packet ID
         spectrum_msg.x_steps,
         spectrum_msg.y_steps,
         spectrum_msg.x_min,
@@ -237,17 +238,16 @@ bool send_spectrum() {
         spectrum_msg.checksum
     );
     
-    // Get the encoded data size
-    size_t msg_len = packet.size();
+    // Get the encoded data size and pointer
+    const size_t msg_len = packet.data.size();
+    const uint8_t* data_ptr = packet.data.data();
+    
+    Serial.print("Encoded message length: ");
     Serial.println(msg_len);
     
-    // Check if the message fits in our buffer
-    if (msg_len > BUFFER_SIZE) {
-        return false;  // Message too large for buffer
+    if (msg_len == 0 || msg_len > BUFFER_SIZE) {
+        return false;  // Encoding failed or message too large
     }
-    
-    // Get a pointer to the encoded data
-    const uint8_t* data_ptr = packet.data();
     
     // Send the message with 4-byte length prefix (big-endian)
     uint8_t len_bytes[4] = {
