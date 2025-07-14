@@ -5,17 +5,7 @@
 #define ARDUINOJSON_USE_LONG_LONG 1
 #define ARDUINOJSON_USE_DOUBLE 1
 #define ARDUINOJSON_DECODE_UNICODE 1
-#include <ArduinoJson.h>
-#include <MsgPack.h>
-
-// Disable debug logging to reduce noise
-#ifndef DEBUGLOG_DEFAULT_LOG_LEVEL
-#define DEBUGLOG_DEFAULT_LOG_LEVEL 0
-#endif
-
-// Suppress deprecation warnings for MsgPack library
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#include <MsgPacketizer.h>
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
@@ -157,137 +147,114 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
   return sum;
 }
 
-// MessagePack buffer
-const size_t MSGPACK_BUFFER_SIZE = 8192;  // Increased buffer size for safety
-// Using the modern JsonDocument type alias
-JsonDocument doc(MSGPACK_BUFFER_SIZE);
-MsgPack::Packer packer;
+// MsgPacketizer setup
+const size_t BUFFER_SIZE = 1024;  // Adjust based on your data size
+uint8_t buffer[BUFFER_SIZE];
+
+// Structure to hold spectrum data
+struct SpectrumData {
+    uint32_t x_steps;
+    uint32_t y_steps;
+    float x_min, x_max;
+    float y_min, y_max;
+    std::vector<std::vector<float>> spectrum_data;
+    uint32_t checksum;
+    
+    // This method tells MsgPacketizer how to serialize the data
+    MSGPACK_DEFINE(x_steps, y_steps, x_min, x_max, y_min, y_max, spectrum_data, checksum);
+};
+
+SpectrumData spectrum_msg;
 
 // Calculate checksum of the spectrum data
-uint32_t calculate_checksum(float* spectrum_data, size_t data_size,
-                           uint32_t x_steps, uint32_t y_steps, uint32_t z_steps,
-                           float x_min, float x_max, float y_min, float y_max, float z_min, float z_max) {
-  uint32_t sum = 0;
-  const uint8_t* data = (const uint8_t*)spectrum_data;
-  
-  // Add spectrum data to checksum
-  for (size_t i = 0; i < data_size * sizeof(float); i++) {
-    sum += data[i];
-  }
-  
-  // Add other fields to the checksum using memcpy to avoid type-punning
-  sum += x_steps ^ y_steps ^ z_steps;
-  
-  uint32_t bits;
-  memcpy(&bits, &x_min, sizeof(x_min));
-  sum += bits;
-  memcpy(&bits, &x_max, sizeof(x_max));
-  sum += bits;
-  memcpy(&bits, &y_min, sizeof(y_min));
-  sum += bits;
-  memcpy(&bits, &y_max, sizeof(y_max));
-  sum += bits;
-  memcpy(&bits, &z_min, sizeof(z_min));
-  sum += bits;
-  memcpy(&bits, &z_max, sizeof(z_max));
-  sum += bits;
-  
-  return sum;
+uint32_t calculate_checksum(const SpectrumData& data) {
+    uint32_t checksum = 0;
+    
+    // Add header values to checksum
+    checksum += data.x_steps ^ data.y_steps;
+    
+    // Add float values by reinterpreting their bits as uint32_t
+    uint32_t* float_as_uint = (uint32_t*)&data.x_min;
+    checksum += *float_as_uint;
+    
+    float_as_uint = (uint32_t*)&data.x_max;
+    checksum += *float_as_uint;
+    
+    float_as_uint = (uint32_t*)&data.y_min;
+    checksum += *float_as_uint;
+    
+    float_as_uint = (uint32_t*)&data.y_max;
+    checksum += *float_as_uint;
+    
+    // Add spectrum data to checksum
+    for (const auto& row : data.spectrum_data) {
+        for (float value : row) {
+            float_as_uint = (uint32_t*)&value;
+            checksum += *float_as_uint;
+        }
+    }
+    
+    return checksum;
 }
 
 bool send_spectrum() {
-  // Clear the document
-  doc.clear();
-  
-  // Calculate total points (2D now)
-  int total_points = GRID_X_STEPS * GRID_Y_STEPS;
-  
-  // Calculate checksum (using original 3D data for consistency)
-  uint32_t checksum = calculate_checksum(
-    music_spectrum, GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS, 
-    GRID_X_STEPS, GRID_Y_STEPS, 1,  // Z dimension is 1 since we're averaging
-    GRID_X_MIN, GRID_X_MAX, GRID_Y_MIN, GRID_Y_MAX, 0, 0  // Z bounds not needed
-  );
-  
-  // Build the message as a JSON document
-  JsonObject root = doc.to<JsonObject>();
-  root["x_steps"] = GRID_X_STEPS;
-  root["y_steps"] = GRID_Y_STEPS;
-  root["z_steps"] = GRID_Z_STEPS;
-  root["x_min"] = GRID_X_MIN;
-  root["x_max"] = GRID_X_MAX;
-  root["y_min"] = GRID_Y_MIN;
-  root["y_max"] = GRID_Y_MAX;
-  root["z_min"] = GRID_Z_MIN;
-  root["z_max"] = GRID_Z_MAX;
-  root["checksum"] = checksum;
-  
-  // Add 2D spectrum data by averaging Z dimension
-  JsonArray spectrum_array = root.createNestedArray("spectrum_data");
-  int points_per_z = GRID_X_STEPS * GRID_Y_STEPS;
-  
-  // For each X,Y position, average across all Z values
-  for (int y = 0; y < GRID_Y_STEPS; y++) {
-    JsonArray y_array = spectrum_array.createNestedArray();
-    for (int x = 0; x < GRID_X_STEPS; x++) {
-      float sum = 0;
-      // Average across Z dimension
-      for (int z = 0; z < GRID_Z_STEPS; z++) {
-        int idx = x + GRID_X_STEPS * (y + GRID_Y_STEPS * z);
-        sum += music_spectrum[idx];
-      }
-      y_array.add(sum / GRID_Z_STEPS);  // Add average value for this X,Y
+    // Prepare the spectrum data
+    spectrum_msg.x_steps = GRID_X_STEPS;
+    spectrum_msg.y_steps = GRID_Y_STEPS;
+    spectrum_msg.x_min = GRID_X_MIN;
+    spectrum_msg.x_max = GRID_X_MAX;
+    spectrum_msg.y_min = GRID_Y_MIN;
+    spectrum_msg.y_max = GRID_Y_MAX;
+    
+    // Resize the 2D vector
+    spectrum_msg.spectrum_data.resize(GRID_Y_STEPS);
+    for (int y = 0; y < GRID_Y_STEPS; y++) {
+        spectrum_msg.spectrum_data[y].resize(GRID_X_STEPS);
+        for (int x = 0; x < GRID_X_STEPS; x++) {
+            // Average over Z dimension
+            float sum = 0;
+            for (int z = 0; z < GRID_Z_STEPS; z++) {
+                sum += music_spectrum[gridToIndex(x, y, z)];
+            }
+            spectrum_msg.spectrum_data[y][x] = sum / GRID_Z_STEPS;
+        }
     }
-  }
-  
-  // Clear and serialize to MessagePack
-  packer.clear();
-  
-  // Serialize to MessagePack
-  size_t len = measureMsgPack(doc);
-  if (len > MSGPACK_BUFFER_SIZE) {
-    return false;  // Not enough space in buffer
-  }
-  
-  uint8_t msgpack_buffer[MSGPACK_BUFFER_SIZE];
-  size_t actual_len = serializeMsgPack(doc, msgpack_buffer, MSGPACK_BUFFER_SIZE);
-  
-  if (actual_len == 0) {
-    return false;  // Serialization failed
-  }
-  
-  // Feed the serialized data to packer
-  packer.feed(msgpack_buffer, actual_len);
-  
-  // First send the message length (4 bytes, big-endian)
-  uint32_t msg_len = packer.size();
-  uint8_t len_bytes[4];
-  len_bytes[0] = (msg_len >> 24) & 0xFF;
-  len_bytes[1] = (msg_len >> 16) & 0xFF;
-  len_bytes[2] = (msg_len >> 8) & 0xFF;
-  len_bytes[3] = msg_len & 0xFF;
-  
-  Serial1.write(len_bytes, 4);
-  
-  // Then send the MessagePack data in chunks to avoid blocking
-  size_t bytes_written = 0;
-  const uint8_t* data = packer.data();
-  size_t data_size = packer.size();
-  
-  while (bytes_written < data_size) {
-    size_t chunk_size = min(64, (int)(data_size - bytes_written));
-    size_t written = Serial1.write(data + bytes_written, chunk_size);
-    if (written == 0) {
-      // Write failed
-      return false;
+    
+    // Calculate and set checksum
+    spectrum_msg.checksum = calculate_checksum(spectrum_msg);
+    
+    // Serialize and send the data
+    auto writer = MsgPacketizer::encodeTo(buffer, BUFFER_SIZE, spectrum_msg);
+    if (!writer) {
+        return false;  // Serialization failed
     }
-    bytes_written += written;
-  }
-  
-  return true;
+    
+    // Send the message with 4-byte length prefix
+    uint32_t msg_len = writer.size();
+    uint8_t len_bytes[4] = {
+        (uint8_t)((msg_len >> 24) & 0xFF),
+        (uint8_t)((msg_len >> 16) & 0xFF),
+        (uint8_t)((msg_len >> 8) & 0xFF),
+        (uint8_t)(msg_len & 0xFF)
+    };
+    
+    // Send length prefix
+    Serial1.write(len_bytes, 4);
+    
+    // Send message in chunks
+    size_t bytes_sent = 0;
+    while (bytes_sent < msg_len) {
+        size_t chunk_size = min(64, (int)(msg_len - bytes_sent));
+        size_t written = Serial1.write(buffer + bytes_sent, chunk_size);
+        if (written == 0) {
+            delay(1);
+            continue;
+        }
+        bytes_sent += written;
+    }
+    
+    return true;
 }
-
-#pragma GCC diagnostic pop
 
 void run_music_algorithm() {
   // Serial.println("1. Starting FFT processing...");

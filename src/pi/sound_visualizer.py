@@ -3,10 +3,11 @@ import matplotlib
 matplotlib.use('Agg')  # For headless operation
 import matplotlib.pyplot as plt
 import serial
-import json
 import os
 import time
 import glob
+import struct
+import msgpack
 import serial.tools.list_ports
 from datetime import datetime
 
@@ -78,36 +79,32 @@ def find_magic(ser):
 
 def calculate_checksum(message):
     """Calculate checksum of the message data to verify integrity"""
+    import struct
     checksum = 0
     
-    # Add integer fields to checksum
-    checksum += message.get('x_steps', 0) ^ message.get('y_steps', 0) ^ message.get('z_steps', 0)
+    # Add header values to checksum
+    checksum += message[b'x_steps'] ^ message[b'y_steps']
     
-    # Add float fields to checksum by interpreting them as bytes
-    for field in ['x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max']:
-        if field in message:
-            # Convert float to bytes and then to integer for checksum
-            float_bytes = struct.pack('!f', message[field])
-            checksum += struct.unpack('!I', float_bytes)[0]
+    # Add float values
+    for field in [b'x_min', b'x_max', b'y_min', b'y_max']:
+        float_val = struct.unpack('!f', message[field])[0]
+        checksum += struct.unpack('!I', struct.pack('!f', float_val))[0]
     
-    # Add spectrum data to checksum
-    if 'spectrum_data' in message and isinstance(message['spectrum_data'], list):
-        for value in message['spectrum_data']:
-            # Convert each float to bytes and add to checksum
-            float_bytes = struct.pack('!f', value)
-            checksum += sum(float_bytes)
+    # Add 2D spectrum data to checksum
+    if b'spectrum_data' in message:
+        for row in message[b'spectrum_data']:
+            for value in row:
+                checksum += struct.unpack('!I', struct.pack('!f', value))[0]
     
     return checksum & 0xFFFFFFFF  # Ensure 32-bit unsigned
 
-def read_messagepack_message(ser, timeout=5.0):
-    """Read a MessagePack message with length prefix and verify checksum"""
-    import struct
-    
+def read_msgpacketizer_message(ser, timeout=5.0):
+    """Read a MsgPacketizer message with length prefix and verify checksum"""
     start_time = time.time()
     
     # Read the 4-byte length prefix (big-endian)
     length_data = bytearray()
-    while len(length_data) < MESSAGEPACK_HEADER_SIZE:
+    while len(length_data) < 4:  # 4-byte length prefix
         if time.time() - start_time > timeout:
             log_message("Timeout waiting for message length")
             return None
@@ -115,17 +112,16 @@ def read_messagepack_message(ser, timeout=5.0):
         if ser.in_waiting > 0:
             chunk = ser.read(ser.in_waiting)
             length_data.extend(chunk)
-            log_message(f"Read {len(chunk)} bytes of length data")
         else:
             time.sleep(0.01)
     
-    if len(length_data) < MESSAGEPACK_HEADER_SIZE:
+    if len(length_data) < 4:
         log_message(f"Incomplete length data: {len(length_data)} bytes")
         return None
     
     # Unpack the 4-byte big-endian length
     try:
-        msg_length = struct.unpack('>I', length_data[:MESSAGEPACK_HEADER_SIZE])[0]
+        msg_length = struct.unpack('>I', length_data[:4])[0]
         log_message(f"Message length: {msg_length} bytes")
     except struct.error as e:
         log_message(f"Error unpacking message length: {e}")
@@ -133,19 +129,19 @@ def read_messagepack_message(ser, timeout=5.0):
         return None
     
     # Sanity check message length
-    if msg_length > MAX_MESSAGE_SIZE:
-        log_message(f"Message length {msg_length} exceeds maximum allowed size {MAX_MESSAGE_SIZE}")
+    if msg_length > MAX_MESSAGE_SIZE or msg_length == 0:
+        log_message(f"Invalid message length: {msg_length}")
         return None
     
     # Read the message data
     data = bytearray()
     bytes_read = 0
     
-    log_message(f"Reading {msg_length} bytes of MessagePack data...")
+    log_message(f"Reading {msg_length} bytes of MsgPack data...")
     
     while bytes_read < msg_length:
         if time.time() - start_time > timeout:
-            log_message(f"Timeout reading MessagePack data (got {bytes_read}/{msg_length} bytes)")
+            log_message(f"Timeout reading MsgPack data (got {bytes_read}/{msg_length} bytes)")
             return None
             
         if ser.in_waiting > 0:
@@ -161,15 +157,33 @@ def read_messagepack_message(ser, timeout=5.0):
         log_message(f"Incomplete message: expected {msg_length} bytes, got {bytes_read}")
         return None
     
-    # Try to unpack the MessagePack data
+    # Try to unpack the MsgPack data
     try:
-        result = msgpack.unpackb(data, raw=False)
-        log_message("Successfully unpacked MessagePack message")
+        # First try to unpack as a standard message
+        try:
+            result = msgpack.unpackb(data, raw=True, strict_map_key=False)
+            log_message("Successfully unpacked MsgPack message")
+        except Exception as e:
+            log_message(f"Failed to unpack MsgPack data: {e}")
+            return None
+        
+        # Convert bytes keys to strings for easier handling
+        result = {k.decode() if isinstance(k, bytes) else k: v for k, v in result.items()}
         
         # Verify checksum if present
         if 'checksum' in result:
-            received_checksum = result['checksum']
-            calculated_checksum = calculate_checksum(result)
+            # Make a copy of the result and remove checksum for calculation
+            checksum_data = result.copy()
+            received_checksum = checksum_data.pop('checksum')
+            
+            # Convert back to bytes for checksum calculation
+            checksum_data_bytes = {}
+            for k, v in checksum_data.items():
+                if isinstance(k, str):
+                    k = k.encode()
+                checksum_data_bytes[k] = v
+            
+            calculated_checksum = calculate_checksum(checksum_data_bytes)
             
             if received_checksum != calculated_checksum:
                 log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
@@ -179,29 +193,29 @@ def read_messagepack_message(ser, timeout=5.0):
             log_message("Warning: No checksum found in message")
         
         # Log some basic info about the data
-        if isinstance(result, dict):
-            log_message(f"Message keys: {list(result.keys())}")
-            if 'spectrum_data' in result and isinstance(result['spectrum_data'], list):
-                log_message(f"Spectrum data length: {len(result['spectrum_data'])}")
-                if len(result['spectrum_data']) > 0:
-                    log_message(f"First value: {result['spectrum_data'][0]}")
+        log_message(f"Message keys: {list(result.keys())}")
+        if 'spectrum_data' in result and isinstance(result['spectrum_data'], list):
+            log_message(f"Spectrum data dimensions: {len(result['spectrum_data'])}x{len(result['spectrum_data'][0]) if result['spectrum_data'] else 0}")
         
         return result
         
     except Exception as e:
-        log_message(f"Failed to unpack MessagePack data: {e}")
-        log_message(f"First 100 bytes (hex): {data[:100].hex()}")
-        log_message(f"First 100 bytes (ASCII): {data[:100].decode('ascii', errors='replace')}")
+        log_message(f"Failed to process message: {e}")
+        if data:
+            log_message(f"First 100 bytes (hex): {data[:100].hex()}")
         import traceback
         log_message(traceback.format_exc())
         return None
 
 def read_spectrum(ser):
     """Read a complete spectrum data message from the serial port"""
-    message = read_messagepack_message(ser)
+    message = read_msgpacketizer_message(ser)
     if message and 'spectrum_data' in message:
         # Add timestamp to the message
         message['timestamp'] = datetime.now()
+        
+        # Convert bytes keys to strings if needed
+        message = {k.decode() if isinstance(k, bytes) else k: v for k, v in message.items()}
         
         # Validate spectrum data dimensions (2D array now)
         if all(key in message for key in ['x_steps', 'y_steps']):
