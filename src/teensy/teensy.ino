@@ -1,11 +1,12 @@
 #include <Audio.h>
 #include <arm_math.h>
 #include "linalg.h"
-#include "AudioFilterSPH0645.h"
+#include <MsgPacketizer.h>
+
+#define DEBUGLOG_DEFAULT_LOG_LEVEL DEBUGLOG_LEVEL_WARN
 #define ARDUINOJSON_USE_LONG_LONG 1
 #define ARDUINOJSON_USE_DOUBLE 1
 #define ARDUINOJSON_DECODE_UNICODE 1
-#include <MsgPacketizer.h>
 
 // Structure to hold spectrum data
 struct SpectrumData {
@@ -224,31 +225,24 @@ bool send_spectrum() {
     // Calculate and set checksum
     spectrum_msg.checksum = calculate_checksum(spectrum_msg);
     
-    // Serialize the data
-    MsgPacketizer::encode(
-        buffer,
-        BUFFER_SIZE,
-        spectrum_msg.x_steps,
-        spectrum_msg.y_steps,
-        spectrum_msg.x_min,
-        spectrum_msg.x_max,
-        spectrum_msg.y_min,
-        spectrum_msg.y_max,
-        spectrum_msg.spectrum_data,
-        spectrum_msg.checksum
-    );
+    // Create a packetizer instance
+    static auto packet = MsgPacketizer::encodeTo(buffer, BUFFER_SIZE);
     
-    // Calculate message length (MsgPacketizer::getSize() returns the encoded size)
-    size_t msg_len = MsgPacketizer::getSize(
-        spectrum_msg.x_steps,
-        spectrum_msg.y_steps,
-        spectrum_msg.x_min,
-        spectrum_msg.x_max,
-        spectrum_msg.y_min,
-        spectrum_msg.y_max,
-        spectrum_msg.spectrum_data,
-        spectrum_msg.checksum
-    );
+    // Clear previous data
+    packet.clear();
+    
+    // Add all data to the packet
+    packet << spectrum_msg.x_steps
+           << spectrum_msg.y_steps
+           << spectrum_msg.x_min
+           << spectrum_msg.x_max
+           << spectrum_msg.y_min
+           << spectrum_msg.y_max
+           << spectrum_msg.spectrum_data
+           << spectrum_msg.checksum;
+    
+    // Get the encoded data size
+    size_t msg_len = packet.size();
     
     // Send the message with 4-byte length prefix (big-endian)
     uint8_t len_bytes[4] = {
