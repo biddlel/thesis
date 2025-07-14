@@ -2,6 +2,9 @@
 #include <arm_math.h>
 #include "linalg.h"
 #include "AudioFilterSPH0645.h"
+#define ARDUINOJSON_USE_LONG_LONG 1
+#define ARDUINOJSON_USE_DOUBLE 1
+#define ARDUINOJSON_DECODE_UNICODE 1
 #include <ArduinoJson.h>
 #include <MsgPack.h>
 
@@ -9,6 +12,10 @@
 #ifndef DEBUGLOG_DEFAULT_LOG_LEVEL
 #define DEBUGLOG_DEFAULT_LOG_LEVEL 0
 #endif
+
+// Suppress deprecation warnings for MsgPack library
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
@@ -152,7 +159,8 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 
 // MessagePack buffer
 const size_t MSGPACK_BUFFER_SIZE = 8192;  // Increased buffer size for safety
-ArduinoJson::StaticJsonDocument<MSGPACK_BUFFER_SIZE> doc;
+// Using the modern JsonDocument type alias
+JsonDocument doc(MSGPACK_BUFFER_SIZE);
 MsgPack::Packer packer;
 
 // Calculate checksum of the spectrum data
@@ -216,8 +224,8 @@ bool send_spectrum() {
   root["z_max"] = GRID_Z_MAX;
   root["checksum"] = checksum;
   
-  // Add spectrum data as an array using modern API
-  JsonArray spectrum_array = root["spectrum_data"].to<JsonArray>();
+  // Add spectrum data as an array
+  JsonArray spectrum_array = root.createNestedArray("spectrum_data");
   for (int i = 0; i < total_points; i++) {
     int x = i % GRID_X_STEPS;
     int y = (i / GRID_X_STEPS) % GRID_Y_STEPS;
@@ -228,11 +236,22 @@ bool send_spectrum() {
   
   // Clear and serialize to MessagePack
   packer.clear();
-  packer.serialize(doc);
   
-  if (packer.size() == 0) {
+  // Serialize to MessagePack
+  size_t len = measureMsgPack(doc);
+  if (len > MSGPACK_BUFFER_SIZE) {
+    return false;  // Not enough space in buffer
+  }
+  
+  uint8_t msgpack_buffer[MSGPACK_BUFFER_SIZE];
+  size_t actual_len = serializeMsgPack(doc, msgpack_buffer, MSGPACK_BUFFER_SIZE);
+  
+  if (actual_len == 0) {
     return false;  // Serialization failed
   }
+  
+  // Feed the serialized data to packer
+  packer.feed(msgpack_buffer, actual_len);
   
   // First send the message length (4 bytes, big-endian)
   uint32_t msg_len = packer.size();
@@ -246,9 +265,12 @@ bool send_spectrum() {
   
   // Then send the MessagePack data in chunks to avoid blocking
   size_t bytes_written = 0;
-  while (bytes_written < packer.size()) {
-    size_t chunk_size = min(64, (int)(packer.size() - bytes_written));
-    size_t written = Serial1.write(packer.data() + bytes_written, chunk_size);
+  const uint8_t* data = packer.data();
+  size_t data_size = packer.size();
+  
+  while (bytes_written < data_size) {
+    size_t chunk_size = min(64, (int)(data_size - bytes_written));
+    size_t written = Serial1.write(data + bytes_written, chunk_size);
     if (written == 0) {
       // Write failed
       return false;
@@ -258,6 +280,8 @@ bool send_spectrum() {
   
   return true;
 }
+
+#pragma GCC diagnostic pop
 
 void run_music_algorithm() {
   // Serial.println("1. Starting FFT processing...");
