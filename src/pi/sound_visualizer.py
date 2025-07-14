@@ -82,32 +82,33 @@ def calculate_checksum(message):
     import struct
     checksum = 0
     
-    if isinstance(message, dict):
-        # Dictionary format
-        x_steps = message.get('x_steps', 0) if isinstance(message.get('x_steps'), int) else 0
-        y_steps = message.get('y_steps', 0) if isinstance(message.get('y_steps'), int) else 0
-        checksum += x_steps ^ y_steps
-        
-        # Add float values
-        for field in ['x_min', 'x_max', 'y_min', 'y_max']:
-            if field in message and isinstance(message[field], (int, float)):
-                # Convert to bytes and back to get consistent bit pattern
-                float_val = float(message[field])
-                checksum += struct.unpack('!I', struct.pack('!f', float_val))[0]
-        
-        # Add 2D spectrum data to checksum
-        if 'spectrum_data' in message and isinstance(message['spectrum_data'], (list, tuple)):
-            for row in message['spectrum_data']:
-                if not isinstance(row, (list, tuple)):
-                    continue
-                for value in row:
-                    if isinstance(value, (int, float)):
-                        checksum += struct.unpack('!I', struct.pack('!f', float(value)))[0]
+    # Add header values to checksum
+    x_steps = message.get('x_steps', 0)
+    y_steps = message.get('y_steps', 0)
+    checksum += x_steps ^ y_steps
+    
+    # Add float values to checksum
+    for field in ['x_min', 'x_max', 'y_min', 'y_max']:
+        if field in message and isinstance(message[field], (int, float)):
+            # Convert to bytes and back to get consistent bit pattern
+            float_val = float(message[field])
+            checksum += struct.unpack('>I', struct.pack('>f', float_val))[0]
+    
+    # Add 2D spectrum data to checksum
+    if 'spectrum_data' in message and isinstance(message['spectrum_data'], (list, tuple)):
+        for row in message['spectrum_data']:
+            if not isinstance(row, (list, tuple)):
+                continue
+            for value in row:
+                if isinstance(value, (int, float)):
+                    # Convert to bytes and back to get consistent bit pattern
+                    float_val = float(value)
+                    checksum += struct.unpack('>I', struct.pack('>f', float_val))[0]
     
     return checksum & 0xFFFFFFFF  # Ensure 32-bit unsigned
 
-def read_msgpacketizer_message(ser, timeout=5.0):
-    """Read a MsgPacketizer message with start/end markers and length prefix"""
+def read_binary_message(ser, timeout=5.0):
+    """Read a binary message with start/end markers and length prefix"""
     start_time = time.time()
     
     # Wait for start of message marker (0x1F)
@@ -120,7 +121,7 @@ def read_msgpacketizer_message(ser, timeout=5.0):
             marker = ser.read(1)[0]
             if marker == 0x1F:  # Start of message marker
                 break
-            elif marker != 0x1F:
+            else:
                 log_message(f"Unexpected byte 0x{marker:02x}, expected start marker 0x1F")
                 # Skip this byte and continue looking for start marker
                 continue
@@ -133,18 +134,14 @@ def read_msgpacketizer_message(ser, timeout=5.0):
             return None
             
         if ser.in_waiting > 0:
-            chunk = ser.read(ser.in_waiting)
+            chunk = ser.read(1)  # Read one byte at a time for length
             length_data.extend(chunk)
         else:
-            time.sleep(0.01)
-    
-    if len(length_data) < 4:
-        log_message(f"Incomplete length data: {len(length_data)} bytes")
-        return None
+            time.sleep(0.001)
     
     # Unpack the 4-byte big-endian length
     try:
-        msg_length = struct.unpack('>I', length_data[:4])[0]
+        msg_length = struct.unpack('>I', length_data)[0]
         log_message(f"Message length: {msg_length} bytes")
     except struct.error as e:
         log_message(f"Error unpacking message length: {e}")
@@ -153,13 +150,14 @@ def read_msgpacketizer_message(ser, timeout=5.0):
     
     # Sanity check message length
     if msg_length > MAX_MESSAGE_SIZE or msg_length == 0:
+        log_message(f"Invalid message length: {msg_length}")
         return None
     
     # Read the message data
     data = bytearray()
     bytes_read = 0
     
-    log_message(f"Reading {msg_length} bytes of MsgPack data...")
+    log_message(f"Reading {msg_length} bytes of binary data...")
     
     while bytes_read < msg_length:
         if time.time() - start_time > timeout:
@@ -177,53 +175,18 @@ def read_msgpacketizer_message(ser, timeout=5.0):
         if msg_length > 1000 and bytes_read % 1000 == 0:  # Log progress for large messages
             log_message(f"Read {bytes_read}/{msg_length} bytes ({bytes_read/msg_length*100:.1f}%)")
     
-    # Read and verify end of message marker (0x1E)
-    end_marker = ser.read(1)
-    if not end_marker or end_marker[0] != 0x1E:
-        log_message(f"Missing or invalid end marker. Got: {end_marker.hex() if end_marker else 'None'}")
-        return None
-        
     if bytes_read != msg_length:
         log_message(f"Incomplete message: expected {msg_length} bytes, got {bytes_read}")
         return None
     
-    # Try to unpack the MsgPack data
     try:
-        # First try to unpack as a standard message
-        try:
-            result = msgpack.unpackb(data, raw=False, strict_map_key=False)
-            log_message("Successfully unpacked MsgPack message")
-            
-            # MsgPacketizer sends data as an array, convert to dict
-            if isinstance(result, list):
-                keys = ['x_steps', 'y_steps', 'x_min', 'x_max', 'y_min', 'y_max', 'spectrum_data', 'checksum']
-                result = dict(zip(keys, result))
-                log_message("Converted array to dictionary format")
-            
-            # Convert bytes keys to strings for easier handling if needed
-            if isinstance(result, dict):
-                result = {k.decode() if isinstance(k, bytes) else k: v for k, v in result.items()}
-                
-                # Verify checksum if present
-                if 'checksum' in result:
-                    # Make a copy of the result and remove checksum for calculation
-                    checksum_data = result.copy()
-                    received_checksum = checksum_data.pop('checksum')
-                    
-                    # Calculate checksum of the data
-                    calculated_checksum = calculate_checksum(checksum_data)
-                    
-                    if received_checksum != calculated_checksum:
-                        log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
-                        return None
-                    log_message("Checksum verified successfully")
-                
-                return result
-            
-        except Exception as e:
-            log_message(f"Failed to unpack MsgPack data: {e}")
-            log_message(f"Raw data (hex): {data.hex()}")
+        # Read and verify end of message marker (0x1E)
+        end_marker = ser.read(1)
+        if not end_marker or end_marker[0] != 0x1E:
+            log_message(f"Missing or invalid end marker. Got: {end_marker.hex() if end_marker else 'None'}")
             return None
+            
+        return data
     except Exception as e:
         log_message(f"Failed to process message: {e}")
         if data:
@@ -232,31 +195,72 @@ def read_msgpacketizer_message(ser, timeout=5.0):
         log_message(traceback.format_exc())
         return None
 
-def read_spectrum(ser):
-    """Read a complete spectrum data message from the serial port"""
-    message = read_msgpacketizer_message(ser)
-    if message and 'spectrum_data' in message:
-        # Add timestamp to the message
-        message['timestamp'] = datetime.now()
+def read_sound_sources(ser):
+    """Read and parse sound sources data from the serial port"""
+    data = read_binary_message(ser)
+    if not data:
+        return None
+    
+    try:
+        offset = 0
         
-        # Convert bytes keys to strings if needed
-        message = {k.decode() if isinstance(k, bytes) else k: v for k, v in message.items()}
+        # Read source count
+        if len(data) < 1:
+            raise ValueError("No data received")
+        source_count = data[0]
+        offset += 1
         
-        # Validate spectrum data dimensions (2D array now)
-        if all(key in message for key in ['x_steps', 'y_steps']):
-            # Check if we have the correct number of rows (Y)
-            if len(message['spectrum_data']) != message['y_steps']:
-                log_message(f"Y dimension mismatch: expected {message['y_steps']} rows, got {len(message['spectrum_data'])}")
-                return None
+        # Calculate expected data size
+        SOURCE_SIZE = 12  # 3 floats (x, y, strength) * 4 bytes each
+        expected_size = 1 + (source_count * SOURCE_SIZE) + 4  # count + sources + checksum
+        
+        if len(data) != expected_size:
+            raise ValueError(f"Invalid data length: expected {expected_size} bytes, got {len(data)}")
+        
+        # Read sources
+        sources = []
+        for _ in range(source_count):
+            if offset + SOURCE_SIZE > len(data):
+                raise ValueError("Unexpected end of data while reading sources")
             
-            # Check each row has the correct number of columns (X)
-            for i, row in enumerate(message['spectrum_data']):
-                if len(row) != message['x_steps']:
-                    log_message(f"X dimension mismatch in row {i}: expected {message['x_steps']} columns, got {len(row)}")
-                    return None
-                    
+            # Read x, y, strength as floats
+            x = struct.unpack('>f', data[offset:offset+4])[0]; offset += 4
+            y = struct.unpack('>f', data[offset:offset+4])[0]; offset += 4
+            strength = struct.unpack('>f', data[offset:offset+4])[0]; offset += 4
+            
+            sources.append({
+                'x': x,
+                'y': y,
+                'strength': strength
+            })
+        
+        # Read checksum
+        received_checksum = struct.unpack('>I', data[offset:offset+4])[0]
+        
+        # Create message dictionary
+        message = {
+            'sources': sources,
+            'count': source_count,
+            'checksum': received_checksum,
+            'timestamp': datetime.now()
+        }
+        
+        # Calculate checksum (sum of all bytes except the last 4)
+        calculated_checksum = sum(data[:-4])
+        
+        # Verify checksum
+        if received_checksum != calculated_checksum:
+            log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
+            return None
+        
+        log_message(f"Successfully read {source_count} sound sources")
         return message
-    return None
+        
+    except Exception as e:
+        log_message(f"Error parsing sound sources: {e}")
+        import traceback
+        log_message(traceback.format_exc())
+        return None
 
 def plot_spectrum(spectrum_data, output_dir, plot_number):
     """Create and save a visualization of the spectrum"""
@@ -333,58 +337,28 @@ def main():
     if not port:
         log_message("Error: Could not find Teensy. Please check the connection.")
         return
-        
-    log_message(f"Found Teensy at {port}, connecting at {BAUD_RATE} baud...")
+    
+    # Main loop
+    plot_number = 0
+    last_plot_time = time.time()
     
     try:
-        # Open serial connection with explicit timeout and buffer settings
-        ser = serial.Serial(
-            port=port,
-            baudrate=BAUD_RATE,
-            timeout=1.0,  # Shorter timeout for faster response
-            write_timeout=1.0,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            xonxoff=False,
-            rtscts=False,
-            dsrdtr=False
-        )
-        
-        # Give the connection a moment to establish
-        time.sleep(2)
-        
-        # Flush any existing data in the input buffer
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-        
-        log_message(f"Connected to {ser.name}")
-        log_message("Waiting for data from Teensy...")
-        
-        plot_number = 0
-        last_plot_time = 0
-        last_log_time = time.time()
-        
         while True:
-            current_time = time.time()
+            # Read sound sources
+            sources_data = read_sound_sources(ser)
             
-            # Read data from serial
-            spectrum_data = read_spectrum(ser)
-            
-            # If we have valid data and enough time has passed, create a plot
-            if spectrum_data and (current_time - last_plot_time) >= PLOT_INTERVAL:
-                plot_path = plot_spectrum(spectrum_data, OUTPUT_DIR, plot_number)
-                if plot_path:
-                    log_message(f"Saved plot: {plot_path}")
-                    
-                    # Log peak position
-                    max_idx = np.unravel_index(np.argmax(spectrum_data['spectrum']), 
-                                             spectrum_data['spectrum'].shape)
-                    x_pos = spectrum_data['x'][max_idx[0]]
-                    y_pos = spectrum_data['y'][max_idx[1]]
-                    z_pos = spectrum_data['z'][max_idx[2]]
-                    log_message(f"Peak at: X={x_pos:.1f}mm, Y={y_pos:.1f}mm, Z={z_pos:.1f}mm")
+            if sources_data and sources_data['count'] > 0:
+                # Filter sources by minimum strength
+                filtered_sources = [s for s in sources_data['sources'] if s['strength'] >= args.min_strength]
+                sources_data['sources'] = filtered_sources
+                sources_data['count'] = len(filtered_sources)
                 
+                # Plot at specified interval if we have any sources
+                current_time = time.time()
+                if current_time - last_plot_time >= args.plot_interval and sources_data['count'] > 0:
+                    plot_sound_sources(sources_data, args.output, plot_number)
+                    plot_number += 1
+                    last_plot_time = current_time
                 # Clean up old plots periodically
                 if plot_number % 10 == 0:
                     cleanup_old_plots(OUTPUT_DIR, MAX_PLOTS)

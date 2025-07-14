@@ -1,12 +1,32 @@
 #include <Audio.h>
 #include <arm_math.h>
 #include "linalg.h"
-#include <MsgPacketizer.h>
+// Simple binary protocol for spectrum data
 
 #define DEBUGLOG_DEFAULT_LOG_LEVEL DEBUGLOG_LEVEL_WARN
 #define ARDUINOJSON_USE_LONG_LONG 1
 #define ARDUINOJSON_USE_DOUBLE 1
 #define ARDUINOJSON_DECODE_UNICODE 1
+
+// Structure to hold sound source location
+struct SoundSource {
+    float x;        // X coordinate
+    float y;        // Y coordinate
+    float strength; // Relative strength (0.0 to 1.0)
+};
+
+// Sound sources data structure
+struct SoundSources {
+    uint8_t count;  // Number of sources (max 255)
+    SoundSource sources[10]; // Fixed size array for simplicity
+    uint32_t checksum;
+    
+    // This method tells MsgPacketizer how to serialize the data
+    MSGPACK_DEFINE(count, sources, checksum);
+};
+
+// Global instance
+SoundSources sound_sources_msg;
 
 // Structure to hold spectrum data
 struct SpectrumData {
@@ -164,9 +184,13 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
   return sum;
 }
 
-// MsgPacketizer setup
-const size_t BUFFER_SIZE = 4096;  // Increased buffer size for safety
+// Buffer for serial communication
+const size_t BUFFER_SIZE = 4096;  // Buffer size for serial communication
 uint8_t buffer[BUFFER_SIZE];
+
+// Protocol constants
+const uint8_t START_MARKER = 0x1F;
+const uint8_t END_MARKER = 0x1E;
 
 // Calculate checksum of the spectrum data
 uint32_t calculate_checksum(const SpectrumData& data) {
@@ -175,107 +199,130 @@ uint32_t calculate_checksum(const SpectrumData& data) {
     // Add header values to checksum
     checksum += data.x_steps ^ data.y_steps;
     
-    // Add float values by reinterpreting their bits as uint32_t
-    uint32_t* float_as_uint = (uint32_t*)&data.x_min;
-    checksum += *float_as_uint;
+    // Add float values
+    uint32_t* x_min_ptr = (uint32_t*)&data.x_min;
+    uint32_t* x_max_ptr = (uint32_t*)&data.x_max;
+    uint32_t* y_min_ptr = (uint32_t*)&data.y_min;
+    uint32_t* y_max_ptr = (uint32_t*)&data.y_max;
     
-    float_as_uint = (uint32_t*)&data.x_max;
-    checksum += *float_as_uint;
+    checksum += *x_min_ptr + *x_max_ptr + *y_min_ptr + *y_max_ptr;
     
-    float_as_uint = (uint32_t*)&data.y_min;
-    checksum += *float_as_uint;
-    
-    float_as_uint = (uint32_t*)&data.y_max;
-    checksum += *float_as_uint;
-    
-    // Add spectrum data to checksum
+    // Add 2D spectrum data to checksum
     for (const auto& row : data.spectrum_data) {
         for (float value : row) {
-            float_as_uint = (uint32_t*)&value;
-            checksum += *float_as_uint;
+            uint32_t* val_ptr = (uint32_t*)&value;
+            checksum += *val_ptr;
         }
     }
     
     return checksum;
 }
 
-bool send_spectrum() {
-    // Prepare the spectrum data
-    spectrum_msg.x_steps = GRID_X_STEPS;
-    spectrum_msg.y_steps = GRID_Y_STEPS;
-    spectrum_msg.x_min = GRID_X_MIN;
-    spectrum_msg.x_max = GRID_X_MAX;
-    spectrum_msg.y_min = GRID_Y_MIN;
-    spectrum_msg.y_max = GRID_Y_MAX;
+// Buffer for serial communication
+const size_t BUFFER_SIZE = 4096;  // Buffer size for serial communication
+uint8_t buffer[BUFFER_SIZE];
+
+// Protocol constants
+const uint8_t START_MARKER = 0x1F;
+const uint8_t END_MARKER = 0x1E;
+
+// Write a 32-bit value in big-endian order
+void write_uint32(uint8_t* buffer, uint32_t value) {
+    buffer[0] = (value >> 24) & 0xFF;
+    buffer[1] = (value >> 16) & 0xFF;
+    buffer[2] = (value >> 8) & 0xFF;
+    buffer[3] = value & 0xFF;
+}
+
+// Write a 32-bit float in big-endian order
+void write_float(uint8_t* buffer, float value) {
+    uint32_t* val_ptr = (uint32_t*)&value;
+    write_uint32(buffer, *val_ptr);
+}
+
+bool send_sound_sources() {
+    // Detect sound sources from the current spectrum
+    detect_sound_sources(spectrum_msg, sound_sources_msg);
     
-    // Resize the 2D vector
-    spectrum_msg.spectrum_data.resize(GRID_Y_STEPS);
+    // Prepare the message buffer
+    const size_t HEADER_SIZE = 1 + 4; // count (1) + checksum (4)
+    const size_t SOURCE_SIZE = 3 * 4;  // x, y, strength (each 4 bytes)
+    const size_t MAX_SOURCES = 10;
+    uint8_t buffer[HEADER_SIZE + MAX_SOURCES * SOURCE_SIZE];
+    
+    // Write source count
+    buffer[0] = sound_sources_msg.count;
+    
+    // Write source data
+    for (uint8_t i = 0; i < sound_sources_msg.count; i++) {
+        uint8_t* ptr = buffer + 1 + i * SOURCE_SIZE;
+        
+        // Write x coordinate
+        uint32_t x_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].x);
+        ptr[0] = (x_int >> 24) & 0xFF;
+        ptr[1] = (x_int >> 16) & 0xFF;
+        ptr[2] = (x_int >> 8) & 0xFF;
+        ptr[3] = x_int & 0xFF;
+        
+        // Write y coordinate
+        uint32_t y_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].y);
+        ptr[4] = (y_int >> 24) & 0xFF;
+        ptr[5] = (y_int >> 16) & 0xFF;
+        ptr[6] = (y_int >> 8) & 0xFF;
+        ptr[7] = y_int & 0xFF;
+        
+        // Write strength
+        uint32_t strength_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].strength);
+        ptr[8] = (strength_int >> 24) & 0xFF;
+        ptr[9] = (strength_int >> 16) & 0xFF;
+        ptr[10] = (strength_int >> 8) & 0xFF;
+        ptr[11] = strength_int & 0xFF;
+    }
+    
+    // Calculate and write checksum
+    uint32_t checksum = 0;
+    for (size_t i = 0; i < 1 + sound_sources_msg.count * SOURCE_SIZE; i++) {
+        checksum += buffer[i];
+    
+    // Write header
+    write_uint32(buffer + offset, spectrum_msg.x_steps); offset += 4;
+    write_uint32(buffer + offset, spectrum_msg.y_steps); offset += 4;
+    
+    // Write float values
+    write_float(buffer + offset, spectrum_msg.x_min); offset += 4;
+    write_float(buffer + offset, spectrum_msg.x_max); offset += 4;
+    write_float(buffer + offset, spectrum_msg.y_min); offset += 4;
+    write_float(buffer + offset, spectrum_msg.y_max); offset += 4;
+    
+    // Write 2D spectrum data
     for (int y = 0; y < GRID_Y_STEPS; y++) {
-        spectrum_msg.spectrum_data[y].resize(GRID_X_STEPS);
         for (int x = 0; x < GRID_X_STEPS; x++) {
-            // Average over Z dimension
-            float sum = 0;
-            for (int z = 0; z < GRID_Z_STEPS; z++) {
-                sum += music_spectrum[gridToIndex(x, y, z)];
-            }
-            spectrum_msg.spectrum_data[y][x] = sum / GRID_Z_STEPS;
+            write_float(buffer + offset, spectrum_msg.spectrum_data[y][x]);
+            offset += 4;
         }
     }
     
-    // Calculate and set checksum
-    spectrum_msg.checksum = calculate_checksum(spectrum_msg);
+    // Write checksum
+    write_uint32(buffer + offset, spectrum_msg.checksum);
     
-    // Encode the spectrum data using MsgPacketizer
-    const auto& packet = MsgPacketizer::encode(
-        0,  // packet ID
-        spectrum_msg.x_steps,
-        spectrum_msg.y_steps,
-        spectrum_msg.x_min,
-        spectrum_msg.x_max,
-        spectrum_msg.y_min,
-        spectrum_msg.y_max,
-        spectrum_msg.spectrum_data,
-        spectrum_msg.checksum
-    );
+    // Send the message
+    Serial1.write(START_MARKER);
     
-    // Get the encoded data size and pointer
-    const size_t msg_len = packet.data.size();
-    const uint8_t* data_ptr = packet.data.data();
-    
-    Serial.print("Encoded message length: ");
-    Serial.println(msg_len);
-    
-    if (msg_len == 0 || msg_len > BUFFER_SIZE) {
-        return false;  // Encoding failed or message too large
-    }
-    
-    // Send the message with 4-byte length prefix (big-endian)
+    // Send length (big-endian)
     uint8_t len_bytes[4] = {
-        (uint8_t)((msg_len >> 24) & 0xFF),
-        (uint8_t)((msg_len >> 16) & 0xFF),
-        (uint8_t)((msg_len >> 8) & 0xFF),
-        (uint8_t)(msg_len & 0xFF)
+        (uint8_t)((data_size >> 24) & 0xFF),
+        (uint8_t)((data_size >> 16) & 0xFF),
+        (uint8_t)((data_size >> 8) & 0xFF),
+        (uint8_t)(data_size & 0xFF)
     };
-    
-    // Send the length prefix
-    Serial1.write(0x1F);  // Start of message marker
     Serial1.write(len_bytes, 4);
     
-    // Send the message in chunks to avoid blocking
-    const size_t CHUNK_SIZE = 64;
-    size_t bytes_remaining = msg_len;
+    // Send data
+    Serial1.write(buffer, data_size);
     
-    while (bytes_remaining > 0) {
-        size_t chunk_size = min(bytes_remaining, CHUNK_SIZE);
-        Serial1.write(data_ptr, chunk_size);
-        data_ptr += chunk_size;
-        bytes_remaining -= chunk_size;
-    }
-    
-    // Add an end of message marker
-    Serial1.write(0x1E);  // End of message marker
-    Serial1.flush();  // Ensure all data is sent
-    delay(1);
+    // Send end marker
+    Serial1.write(END_MARKER);
+    Serial1.flush();
     
     return true;
 }
