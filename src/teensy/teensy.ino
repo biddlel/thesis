@@ -7,6 +7,22 @@
 #define ARDUINOJSON_DECODE_UNICODE 1
 #include <MsgPacketizer.h>
 
+// Structure to hold spectrum data
+struct SpectrumData {
+    uint32_t x_steps;
+    uint32_t y_steps;
+    float x_min, x_max;
+    float y_min, y_max;
+    std::vector<std::vector<float>> spectrum_data;
+    uint32_t checksum;
+    
+    // This method tells MsgPacketizer how to serialize the data
+    MSGPACK_DEFINE(x_steps, y_steps, x_min, x_max, y_min, y_max, spectrum_data, checksum);
+};
+
+// Global instance
+SpectrumData spectrum_msg;
+
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
 const int FFT_SIZE = 1024;
@@ -148,23 +164,8 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 }
 
 // MsgPacketizer setup
-const size_t BUFFER_SIZE = 1024;  // Adjust based on your data size
+const size_t BUFFER_SIZE = 4096;  // Increased buffer size for safety
 uint8_t buffer[BUFFER_SIZE];
-
-// Structure to hold spectrum data
-struct SpectrumData {
-    uint32_t x_steps;
-    uint32_t y_steps;
-    float x_min, x_max;
-    float y_min, y_max;
-    std::vector<std::vector<float>> spectrum_data;
-    uint32_t checksum;
-    
-    // This method tells MsgPacketizer how to serialize the data
-    MSGPACK_DEFINE(x_steps, y_steps, x_min, x_max, y_min, y_max, spectrum_data, checksum);
-};
-
-SpectrumData spectrum_msg;
 
 // Calculate checksum of the spectrum data
 uint32_t calculate_checksum(const SpectrumData& data) {
@@ -223,14 +224,33 @@ bool send_spectrum() {
     // Calculate and set checksum
     spectrum_msg.checksum = calculate_checksum(spectrum_msg);
     
-    // Serialize and send the data
-    auto writer = MsgPacketizer::encodeTo(buffer, BUFFER_SIZE, spectrum_msg);
-    if (!writer) {
-        return false;  // Serialization failed
-    }
+    // Serialize the data
+    MsgPacketizer::encode(
+        buffer,
+        BUFFER_SIZE,
+        spectrum_msg.x_steps,
+        spectrum_msg.y_steps,
+        spectrum_msg.x_min,
+        spectrum_msg.x_max,
+        spectrum_msg.y_min,
+        spectrum_msg.y_max,
+        spectrum_msg.spectrum_data,
+        spectrum_msg.checksum
+    );
     
-    // Send the message with 4-byte length prefix
-    uint32_t msg_len = writer.size();
+    // Calculate message length (MsgPacketizer::getSize() returns the encoded size)
+    size_t msg_len = MsgPacketizer::getSize(
+        spectrum_msg.x_steps,
+        spectrum_msg.y_steps,
+        spectrum_msg.x_min,
+        spectrum_msg.x_max,
+        spectrum_msg.y_min,
+        spectrum_msg.y_max,
+        spectrum_msg.spectrum_data,
+        spectrum_msg.checksum
+    );
+    
+    // Send the message with 4-byte length prefix (big-endian)
     uint8_t len_bytes[4] = {
         (uint8_t)((msg_len >> 24) & 0xFF),
         (uint8_t)((msg_len >> 16) & 0xFF),
