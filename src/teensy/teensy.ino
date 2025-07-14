@@ -159,8 +159,7 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 
 bool send_spectrum() {
   // Create a JSON document
-  const size_t capacity = JSON_OBJECT_SIZE(11) + 1024; // Adjust capacity as needed
-  DynamicJsonDocument doc(capacity);
+  JsonDocument doc;
   
   // Add metadata
   doc["x_steps"] = GRID_X_STEPS;
@@ -174,8 +173,11 @@ bool send_spectrum() {
   doc["z_max"] = GRID_Z_MAX;
   
   // Add spectrum data as a flat array
-  JsonArray spectrum_data = doc.createNestedArray("spectrum_data");
+  JsonArray spectrum_data = doc["spectrum_data"].to<JsonArray>();
   int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  
+  // Pre-allocate memory for better performance with large arrays
+  spectrum_data.grow(total_points);
   
   // Copy data to JSON array (flatten the 3D array)
   for (int i = 0; i < total_points; i++) {
