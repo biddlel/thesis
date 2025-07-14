@@ -199,16 +199,14 @@ bool send_spectrum() {
   // Clear the document
   doc.clear();
   
-  // Calculate total points
-  int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  // Calculate total points (2D now)
+  int total_points = GRID_X_STEPS * GRID_Y_STEPS;
   
-  // Calculate checksum
+  // Calculate checksum (using original 3D data for consistency)
   uint32_t checksum = calculate_checksum(
-    music_spectrum, total_points,
-    GRID_X_STEPS, GRID_Y_STEPS, GRID_Z_STEPS,
-    GRID_X_MIN, GRID_X_MAX,
-    GRID_Y_MIN, GRID_Y_MAX,
-    GRID_Z_MIN, GRID_Z_MAX
+    music_spectrum, GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS, 
+    GRID_X_STEPS, GRID_Y_STEPS, 1,  // Z dimension is 1 since we're averaging
+    GRID_X_MIN, GRID_X_MAX, GRID_Y_MIN, GRID_Y_MAX, 0, 0  // Z bounds not needed
   );
   
   // Build the message as a JSON document
@@ -224,14 +222,22 @@ bool send_spectrum() {
   root["z_max"] = GRID_Z_MAX;
   root["checksum"] = checksum;
   
-  // Add spectrum data as an array
+  // Add 2D spectrum data by averaging Z dimension
   JsonArray spectrum_array = root.createNestedArray("spectrum_data");
-  for (int i = 0; i < total_points; i++) {
-    int x = i % GRID_X_STEPS;
-    int y = (i / GRID_X_STEPS) % GRID_Y_STEPS;
-    int z = i / (GRID_X_STEPS * GRID_Y_STEPS);
-    int idx = x + GRID_X_STEPS * (y + GRID_Y_STEPS * z);
-    spectrum_array.add(music_spectrum[idx]);
+  int points_per_z = GRID_X_STEPS * GRID_Y_STEPS;
+  
+  // For each X,Y position, average across all Z values
+  for (int y = 0; y < GRID_Y_STEPS; y++) {
+    JsonArray y_array = spectrum_array.createNestedArray();
+    for (int x = 0; x < GRID_X_STEPS; x++) {
+      float sum = 0;
+      // Average across Z dimension
+      for (int z = 0; z < GRID_Z_STEPS; z++) {
+        int idx = x + GRID_X_STEPS * (y + GRID_Y_STEPS * z);
+        sum += music_spectrum[idx];
+      }
+      y_array.add(sum / GRID_Z_STEPS);  // Add average value for this X,Y
+    }
   }
   
   // Clear and serialize to MessagePack

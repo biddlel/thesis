@@ -203,35 +203,41 @@ def read_spectrum(ser):
         # Add timestamp to the message
         message['timestamp'] = datetime.now()
         
-        # Validate spectrum data if dimensions are provided
-        if all(key in message for key in ['x_steps', 'y_steps', 'z_steps']):
-            expected_length = message['x_steps'] * message['y_steps'] * message['z_steps']
-            if len(message['spectrum_data']) != expected_length:
-                log_message(f"Spectrum data length mismatch: expected {expected_length}, got {len(message['spectrum_data'])}")
+        # Validate spectrum data dimensions (2D array now)
+        if all(key in message for key in ['x_steps', 'y_steps']):
+            # Check if we have the correct number of rows (Y)
+            if len(message['spectrum_data']) != message['y_steps']:
+                log_message(f"Y dimension mismatch: expected {message['y_steps']} rows, got {len(message['spectrum_data'])}")
                 return None
+            
+            # Check each row has the correct number of columns (X)
+            for i, row in enumerate(message['spectrum_data']):
+                if len(row) != message['x_steps']:
+                    log_message(f"X dimension mismatch in row {i}: expected {message['x_steps']} columns, got {len(row)}")
+                    return None
+                    
         return message
     return None
 
 def plot_spectrum(spectrum_data, output_dir, plot_number):
     """Create and save a visualization of the spectrum"""
     try:
-        # Find slice with maximum power
-        max_z_idx = np.argmax(np.max(spectrum_data['spectrum'], axis=(0, 1)))
-        z_value = spectrum_data['z'][max_z_idx]
+        # Convert the 2D array to numpy array
+        spectrum_2d = np.array(spectrum_data['spectrum_data'])
         
         # Create figure
         plt.figure(figsize=(10, 8))
         
-        # Plot XY slice at max Z
-        plt.imshow(spectrum_data['spectrum'][:, :, max_z_idx].T,
-                  extent=[spectrum_data['x'][0], spectrum_data['x'][-1],
-                          spectrum_data['y'][0], spectrum_data['y'][-1]],
+        # Plot the 2D spectrum
+        plt.imshow(spectrum_2d.T,
+                  extent=[spectrum_data['x_min'], spectrum_data['x_max'],
+                          spectrum_data['y_min'], spectrum_data['y_max']],
                   origin='lower', aspect='auto', cmap='viridis')
         
-        plt.colorbar(label='Power (dB)')
+        plt.colorbar(label='Average Power (dB)')
         plt.xlabel('X Position (mm)')
         plt.ylabel('Y Position (mm)')
-        plt.title(f'Sound Source Localization (Z = {z_value:.1f} mm)')
+        plt.title('Sound Source Localization (Z-Averaged)')
         
         # Add timestamp
         timestamp = spectrum_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
