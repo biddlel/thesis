@@ -2,7 +2,7 @@
 #include <arm_math.h>
 #include "linalg.h"
 #include "AudioFilterSPH0645.h"
-#include <MsgPacketizer.h>
+#include <MsgPack.h>
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
@@ -145,89 +145,80 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 }
 
 // MessagePack buffer
-const size_t MSGPACK_BUFFER_SIZE = 4096;
-uint8_t msgpack_buffer[MSGPACK_BUFFER_SIZE];
+const size_t MSGPACK_BUFFER_SIZE = 8192;  // Increased buffer size for safety
+StaticJsonDocument<MSGPACK_BUFFER_SIZE> doc;
 
-// Message structure for spectrum data
-struct SpectrumMessage {
-  uint32_t x_steps;
-  uint32_t y_steps;
-  uint32_t z_steps;
-  float x_min, x_max;
-  float y_min, y_max;
-  float z_min, z_max;
-  uint32_t checksum;  // Checksum of the spectrum data
-  float spectrum_data[GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS];
+// Calculate checksum of the spectrum data
+uint32_t calculate_checksum(float* spectrum_data, size_t data_size,
+                           uint32_t x_steps, uint32_t y_steps, uint32_t z_steps,
+                           float x_min, float x_max, float y_min, float y_max, float z_min, float z_max) {
+  uint32_t sum = 0;
+  const uint8_t* data = (const uint8_t*)spectrum_data;
   
-  // This method tells MsgPacketizer how to serialize this structure
-  MSGPACK_DEFINE(
-    x_steps, y_steps, z_steps,
-    x_min, x_max,
-    y_min, y_max,
-    z_min, z_max,
-    checksum,
-    spectrum_data
-  );
-  
-  // Calculate checksum of the spectrum data
-  uint32_t calculate_checksum() {
-    uint32_t sum = 0;
-    const uint8_t* data = (const uint8_t*)spectrum_data;
-    size_t data_size = sizeof(spectrum_data);
-    
-    for (size_t i = 0; i < data_size; i++) {
-      sum += data[i];
-    }
-    
-    // Add other fields to the checksum
-    sum += x_steps ^ y_steps ^ z_steps;
-    sum += *((uint32_t*)&x_min) + *((uint32_t*)&x_max);
-    sum += *((uint32_t*)&y_min) + *((uint32_t*)&y_max);
-    sum += *((uint32_t*)&z_min) + *((uint32_t*)&z_max);
-    
-    return sum;
+  // Add spectrum data to checksum
+  for (size_t i = 0; i < data_size * sizeof(float); i++) {
+    sum += data[i];
   }
-};
-
-// Global message instance
-SpectrumMessage spectrum_msg;
+  
+  // Add other fields to the checksum
+  sum += x_steps ^ y_steps ^ z_steps;
+  sum += *((uint32_t*)&x_min) + *((uint32_t*)&x_max);
+  sum += *((uint32_t*)&y_min) + *((uint32_t*)&y_max);
+  sum += *((uint32_t*)&z_min) + *((uint32_t*)&z_max);
+  
+  return sum;
+}
 
 bool send_spectrum() {
-  // Fill in the message structure
-  spectrum_msg.x_steps = GRID_X_STEPS;
-  spectrum_msg.y_steps = GRID_Y_STEPS;
-  spectrum_msg.z_steps = GRID_Z_STEPS;
-  spectrum_msg.x_min = GRID_X_MIN;
-  spectrum_msg.x_max = GRID_X_MAX;
-  spectrum_msg.y_min = GRID_Y_MIN;
-  spectrum_msg.y_max = GRID_Y_MAX;
-  spectrum_msg.z_min = GRID_Z_MIN;
-  spectrum_msg.z_max = GRID_Z_MAX;
+  // Clear the document
+  doc.clear();
   
-  // Copy spectrum data to the message structure
+  // Calculate total points
   int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  
+  // Calculate checksum
+  uint32_t checksum = calculate_checksum(
+    music_spectrum, total_points,
+    GRID_X_STEPS, GRID_Y_STEPS, GRID_Z_STEPS,
+    GRID_X_MIN, GRID_X_MAX,
+    GRID_Y_MIN, GRID_Y_MAX,
+    GRID_Z_MIN, GRID_Z_MAX
+  );
+  
+  // Build the message as a JSON document
+  JsonObject root = doc.to<JsonObject>();
+  root["x_steps"] = GRID_X_STEPS;
+  root["y_steps"] = GRID_Y_STEPS;
+  root["z_steps"] = GRID_Z_STEPS;
+  root["x_min"] = GRID_X_MIN;
+  root["x_max"] = GRID_X_MAX;
+  root["y_min"] = GRID_Y_MIN;
+  root["y_max"] = GRID_Y_MAX;
+  root["z_min"] = GRID_Z_MIN;
+  root["z_max"] = GRID_Z_MAX;
+  root["checksum"] = checksum;
+  
+  // Add spectrum data as an array
+  JsonArray spectrum_array = root.createNestedArray("spectrum_data");
   for (int i = 0; i < total_points; i++) {
     int x = i % GRID_X_STEPS;
     int y = (i / GRID_X_STEPS) % GRID_Y_STEPS;
     int z = i / (GRID_X_STEPS * GRID_Y_STEPS);
-    
-    // Convert 3D index to 1D index in the music_spectrum array
     int idx = x + GRID_X_STEPS * (y + GRID_Y_STEPS * z);
-    spectrum_msg.spectrum_data[i] = music_spectrum[idx];
+    spectrum_array.add(music_spectrum[idx]);
   }
   
-  // Calculate and set the checksum after all data is copied
-  spectrum_msg.checksum = spectrum_msg.calculate_checksum();
+  // Serialize to MessagePack
+  size_t len = measureMsgPack(doc);
+  if (len > MSGPACK_BUFFER_SIZE) {
+    return false;  // Not enough space in buffer
+  }
   
-  // Serialize the message to MessagePack format
-  size_t len = MsgPacketizer::encode(
-    msgpack_buffer, MSGPACK_BUFFER_SIZE,  // Buffer and its size
-    spectrum_msg                          // The data to serialize
-  );
+  uint8_t msgpack_buffer[MSGPACK_BUFFER_SIZE];
+  size_t actual_len = serializeMsgPack(doc, msgpack_buffer, MSGPACK_BUFFER_SIZE);
   
-  if (len == 0) {
-    // Serialization failed
-    return false;
+  if (actual_len == 0) {
+    return false;  // Serialization failed
   }
   
   // First send the message length (4 bytes, big-endian)
