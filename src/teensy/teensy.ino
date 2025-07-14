@@ -2,6 +2,7 @@
 #include <arm_math.h>
 #include "linalg.h"
 #include "AudioFilterSPH0645.h"
+#include <ArduinoJson.h>
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
@@ -157,106 +158,48 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 }
 
 bool send_spectrum() {
-  // 1. Prepare the header
-  SpectrumHeader header;
-  header.magic = 0x4D555349;  // 'MUSI' in ASCII
-  header.x_steps = GRID_X_STEPS;
-  header.y_steps = GRID_Y_STEPS;
-  header.z_steps = GRID_Z_STEPS;
-  header.x_min = GRID_X_MIN;
-  header.x_max = GRID_X_MAX;
-  header.y_min = GRID_Y_MIN;
-  header.y_max = GRID_Y_MAX;
-  header.z_min = GRID_Z_MIN;
-  header.z_max = GRID_Z_MAX;
-  header.data_size = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
+  // Create a JSON document
+  const size_t capacity = JSON_OBJECT_SIZE(11) + 1024; // Adjust capacity as needed
+  DynamicJsonDocument doc(capacity);
   
-  // Calculate checksum (excluding the checksum field itself)
-  header.checksum = 0;
-  uint32_t checksum = calculate_checksum(
-      reinterpret_cast<const uint8_t*>(&header), 
-      sizeof(header) - sizeof(header.checksum)
-  );
-  header.checksum = checksum;
+  // Add metadata
+  doc["x_steps"] = GRID_X_STEPS;
+  doc["y_steps"] = GRID_Y_STEPS;
+  doc["z_steps"] = GRID_Z_STEPS;
+  doc["x_min"] = GRID_X_MIN;
+  doc["x_max"] = GRID_X_MAX;
+  doc["y_min"] = GRID_Y_MIN;
+  doc["y_max"] = GRID_Y_MAX;
+  doc["z_min"] = GRID_Z_MIN;
+  doc["z_max"] = GRID_Z_MAX;
   
-  // 2. Send the header
-  size_t header_size = sizeof(header);
-  const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header);
+  // Add spectrum data as a flat array
+  JsonArray spectrum_data = doc.createNestedArray("spectrum_data");
+  int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
   
-  // Write header in chunks if needed
-  size_t header_sent = 0;
-  while (header_sent < header_size) {
-      size_t chunk_size = min(64, static_cast<int>(header_size - header_sent));
-      size_t written = Serial1.write(header_bytes + header_sent, chunk_size);
-      
-      if (written == 0) {
-          // Write failed
-          return false;
-      }
-      
-      header_sent += written;
+  // Copy data to JSON array (flatten the 3D array)
+  for (int i = 0; i < total_points; i++) {
+    int x = i % GRID_X_STEPS;
+    int y = (i / GRID_X_STEPS) % GRID_Y_STEPS;
+    int z = i / (GRID_X_STEPS * GRID_Y_STEPS);
+    
+    // Convert 3D index to 1D index in the music_spectrum array
+    int idx = x + GRID_X_STEPS * (y + GRID_Y_STEPS * z);
+    spectrum_data.add(music_spectrum[idx]);
   }
   
-  // 3. Send the spectrum data in chunks
-  const size_t CHUNK_SIZE = 32;  // Number of floats per chunk
-  const size_t FLOAT_SIZE = sizeof(float);
-  const size_t CHUNK_BYTES = CHUNK_SIZE * FLOAT_SIZE;
+  // Serialize JSON to a string
+  String json_string;
+  serializeJson(doc, json_string);
   
-  size_t total_floats = header.data_size;
-  size_t floats_sent = 0;
+  // Add message separator (double newline)
+  json_string += "\n\n";
   
-  while (floats_sent < total_floats) {
-      size_t remaining_floats = total_floats - floats_sent;
-      size_t chunk_floats = min(CHUNK_SIZE, remaining_floats);
-      size_t chunk_bytes = chunk_floats * FLOAT_SIZE;
-      
-      // Get pointer to the current chunk of data
-      const uint8_t* chunk_ptr = reinterpret_cast<const uint8_t*>(
-          music_spectrum + floats_sent
-      );
-      
-      // Send the chunk
-      size_t bytes_sent = 0;
-      while (bytes_sent < chunk_bytes) {
-          size_t written = Serial1.write(
-              chunk_ptr + bytes_sent, 
-              chunk_bytes - bytes_sent
-          );
-          
-          if (written == 0) {
-              // Write failed
-              return false;
-          }
-          
-          bytes_sent += written;
-      }
-      
-      floats_sent += chunk_floats;
-  }
+  // Send the JSON string over serial
+  size_t bytes_sent = Serial1.print(json_string);
   
-  // 4. Send end marker
-  const uint32_t END_MARKER = 0xFFFFFFFF;
-  size_t marker_sent = 0;
-  const uint8_t* marker_ptr = reinterpret_cast<const uint8_t*>(&END_MARKER);
-  
-  while (marker_sent < sizeof(END_MARKER)) {
-      size_t written = Serial1.write(
-          marker_ptr + marker_sent, 
-          sizeof(END_MARKER) - marker_sent
-      );
-      
-      if (written == 0) {
-          // Write failed
-          return false;
-      }
-      
-      marker_sent += written;
-  }
-  
-  // Flush to ensure all data is sent
-  Serial1.flush();
-  
-  return true;
+  // Return true if all bytes were sent successfully
+  return (bytes_sent == json_string.length());
 }
 
 void run_music_algorithm() {

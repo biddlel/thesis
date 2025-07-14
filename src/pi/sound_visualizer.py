@@ -3,93 +3,132 @@ import matplotlib
 matplotlib.use('Agg')  # For headless operation
 import matplotlib.pyplot as plt
 import serial
-import struct
+import json
 import os
 import time
 from datetime import datetime
 
 # Configuration
-SERIAL_PORT = '/dev/ttyACM0'  # Update this to your serial port
+SERIAL_PORT = '/dev/ttyAMA0'  # Update this to your serial port
 BAUD_RATE = 115200
 OUTPUT_DIR = 'spectrum_plots'
 LOG_FILE = 'spectrum_log.txt'
 PLOT_INTERVAL = 1.0  # Minimum seconds between plots
 MAX_PLOTS = 1000
 
-# Structure for the header (must match the C++ struct)
-class SpectrumHeader:
-    def __init__(self, data):
-        (self.magic,
-         self.x_steps, self.y_steps, self.z_steps,
-         self.x_min, self.x_max,
-         self.y_min, self.y_max,
-         self.z_min, self.z_max,
-         self.data_size,
-         self.checksum) = struct.unpack('<IIIIfffffIII', data)
-    
-    def calculate_checksum(self, data):
-        return sum(data[:40])  # Sum of first 40 bytes (before checksum)
+# JSON message separator
+MESSAGE_SEPARATOR = b'\n\n'  # Double newline to separate JSON messages
+
+# Track if we've logged before in this session
+_first_log = True
 
 def log_message(message):
     """Log messages with timestamp"""
+    global _first_log
+    
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_entry = f"[{timestamp}] {message}"
     print(log_entry)
-    with open(LOG_FILE, 'a') as f:
+    
+    # Clear the log file on first use, then append for subsequent messages
+    mode = 'w' if _first_log else 'a'
+    with open(LOG_FILE, mode) as f:
         f.write(log_entry + '\n')
+    _first_log = False
+
+def dump_hex(data, bytes_per_line=16):
+    """Convert binary data to a hex dump string"""
+    result = []
+    for i in range(0, len(data), bytes_per_line):
+        chunk = data[i:i+bytes_per_line]
+        hex_str = ' '.join(f'{b:02x}' for b in chunk)
+        ascii_str = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
+        result.append(f"{i:04x}: {hex_str.ljust(bytes_per_line*3)}  {ascii_str}")
+    return '\n'.join(result)
+
+def find_magic(ser):
+    """Legacy function kept for compatibility - not used in JSON mode"""
+    log_message("Note: find_magic() is not used in JSON mode")
+    return False, None
+
+def read_json_message(ser, timeout=5.0):
+    """Read a complete JSON message from serial"""
+    start_time = time.time()
+    buffer = bytearray()
+    
+    while True:
+        if time.time() - start_time > timeout:
+            log_message("Timeout waiting for message")
+            return None
+            
+        if ser.in_waiting > 0:
+            chunk = ser.read(ser.in_waiting)
+            buffer += chunk
+            
+            # Look for message separator
+            if MESSAGE_SEPARATOR in buffer:
+                message_end = buffer.find(MESSAGE_SEPARATOR)
+                message = buffer[:message_end].decode('utf-8', errors='ignore')
+                buffer = buffer[message_end + len(MESSAGE_SEPARATOR):]
+                
+                try:
+                    data = json.loads(message)
+                    log_message("Successfully parsed JSON message")
+                    return data
+                except json.JSONDecodeError as e:
+                    log_message(f"JSON decode error: {e}")
+                    log_message(f"Message content: {message[:200]}...")  # Log first 200 chars
+                    continue
+        else:
+            time.sleep(0.01)  # Small delay to prevent busy waiting
 
 def read_spectrum(ser):
-    """Read a complete spectrum data packet"""
+    """Read a complete spectrum data packet in JSON format"""
     try:
-        # Read header (44 bytes: 4 + 3*4 + 6*4 + 4 + 4)
-        header_data = ser.read(44)
-        if len(header_data) != 44:
+        # Read a complete JSON message
+        data = read_json_message(ser)
+        if not data:
+            log_message("Failed to read valid JSON message")
             return None
             
-        header = SpectrumHeader(header_data)
-        
-        # Verify magic number
-        if header.magic != 0x4D555349:  # 'MUSI'
-            log_message(f"Invalid magic number: {hex(header.magic)}")
-            return None
-            
-        # Verify checksum
-        if header.calculate_checksum(header_data) != header.checksum:
-            log_message("Checksum verification failed")
-            return None
-        
-        # Calculate total data size
-        total_bytes = header.data_size * 4  # 4 bytes per float
-        data = bytearray()
-        
-        # Read data in chunks
-        while len(data) < total_bytes:
-            chunk = ser.read(min(1024, total_bytes - len(data)))
-            if not chunk:
-                log_message("Incomplete data")
+        # Extract and validate required fields
+        required_fields = ['x_steps', 'y_steps', 'z_steps', 
+                          'x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max',
+                          'spectrum_data']
+                          
+        for field in required_fields:
+            if field not in data:
+                log_message(f"Missing required field in JSON: {field}")
                 return None
-            data.extend(chunk)
-        
-        # Read end marker
-        end_marker = ser.read(4)
-        if len(end_marker) != 4 or end_marker != b'\xFF\xFF\xFF\xFF':
-            log_message("Invalid end marker")
+                
+        # Convert spectrum data to numpy array
+        try:
+            spectrum = np.array(data['spectrum_data'], dtype=np.float32)
+            expected_size = data['x_steps'] * data['y_steps'] * data['z_steps']
+            
+            if len(spectrum) != expected_size:
+                log_message(f"Spectrum data size mismatch. Expected {expected_size}, got {len(spectrum)}")
+                return None
+                
+            # Reshape the spectrum data
+            spectrum = spectrum.reshape((data['x_steps'], data['y_steps'], data['z_steps']))
+            
+            return {
+                'x': np.linspace(data['x_min'], data['x_max'], data['x_steps']),
+                'y': np.linspace(data['y_min'], data['y_max'], data['y_steps']),
+                'z': np.linspace(data['z_min'], data['z_max'], data['z_steps']),
+                'spectrum': spectrum,
+                'timestamp': datetime.now()
+            }
+            
+        except Exception as e:
+            log_message(f"Error processing spectrum data: {e}")
             return None
-        
-        # Convert to numpy array
-        spectrum = np.frombuffer(data, dtype=np.float32)
-        
-        # Reshape to 3D grid
-        spectrum = spectrum.reshape((header.x_steps, header.y_steps, header.z_steps))
-        
-        return {
-            'spectrum': spectrum,
-            'x': np.linspace(header.x_min, header.x_max, header.x_steps),
-            'y': np.linspace(header.y_min, header.y_max, header.y_steps),
-            'z': np.linspace(header.z_min, header.z_max, header.z_steps),
-            'timestamp': datetime.now()
-        }
-        
+            
+    except Exception as e:
+        log_message(f"Error in read_spectrum: {e}")
+        return None
+
     except Exception as e:
         log_message(f"Error reading spectrum: {e}")
         return None
