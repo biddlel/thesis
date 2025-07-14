@@ -37,13 +37,13 @@ const float GRID_X_MIN = -GRID_SEARCH;    // Min X coordinate
 const float GRID_X_MAX =  GRID_SEARCH;    // Max X coordinate
 const float GRID_Y_MIN = -GRID_SEARCH;    // Min Y coordinate
 const float GRID_Y_MAX =  GRID_SEARCH;    // Max Y coordinate
-const float GRID_Z_MIN =  100.0;          // Min Z coordinate (don't search too close to mics)
+const float GRID_Z_MIN =  0;          // Min Z coordinate (don't search too close to mics)
 const float GRID_Z_MAX = 1000.0;          // Max Z coordinate
 
 // Number of steps in each dimension
 const int GRID_X_STEPS = STEPS;
 const int GRID_Y_STEPS = STEPS;
-const int GRID_Z_STEPS = 10;  // Fewer steps in Z to reduce computation
+const int GRID_Z_STEPS = 4;  // Fewer steps in Z to reduce computation
 
 // --- Audio System Setup ---
 AudioInputI2SQuad    i2s_quad;
@@ -377,14 +377,14 @@ void run_music_algorithm() {
   }
   
   // Also output to Serial1 if connected (e.g., for Raspberry Pi)
-  if (Serial1) {
-    Serial1.print("Estimated 3D Coords (mm): X=");
-    Serial1.print(est_x, 1);
-    Serial1.print(", Y=");
-    Serial1.print(est_y, 1);
-    Serial1.print(", Z=");
-    Serial1.println(est_z, 1);
-  }
+  // if (Serial1) {
+  //   Serial1.print("Estimated 3D Coords (mm): X=");
+  //   Serial1.print(est_x, 1);
+  //   Serial1.print(", Y=");
+  //   Serial1.print(est_y, 1);
+  //   Serial1.print(", Z=");
+  //   Serial1.println(est_z, 1);
+  // }
   
   // Send the complete spectrum data
   send_spectrum();
