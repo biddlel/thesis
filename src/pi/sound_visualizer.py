@@ -24,11 +24,13 @@ MESSAGE_SEPARATOR = b'\n\n'  # Double newline to separate JSON messages
 # Track if we've logged before in this session
 _first_log = True
 
-# Binary message header format
+# Binary message header format (trying both endianness)
 class MessageHeader:
-    STRUCT_FORMAT = '<III'  # Little-endian, 3 unsigned ints (magic, length, checksum)
+    STRUCT_FORMAT_LE = '<III'  # Little-endian
+    STRUCT_FORMAT_BE = '>III'  # Big-endian
     SIZE = 12  # 3 * 4 bytes
     MAGIC = 0x4A534F4E  # 'JSON' in ASCII
+    MAX_MESSAGE_SIZE = 100000  # Sanity check for message size
 
 def find_teensy_port():
     """Try to find the Teensy by checking common ports or listing all available"""
@@ -91,6 +93,7 @@ def read_json_message(ser, timeout=5.0):
     while len(header_data) < MessageHeader.SIZE:
         if time.time() - start_time > timeout:
             log_message("Timeout waiting for message header")
+            log_message(f"Current header data (hex): {header_data.hex()}")
             return None
             
         if ser.in_waiting > 0:
@@ -100,19 +103,39 @@ def read_json_message(ser, timeout=5.0):
         else:
             time.sleep(0.01)
     
-    # Parse header
+    # Try parsing with both endianness
+    magic, length, checksum = None, None, None
+    endianness = None
+    
+    # Try little-endian first
     try:
-        magic, length, checksum = struct.unpack(MessageHeader.STRUCT_FORMAT, header_data[:MessageHeader.SIZE])
+        magic, length, checksum = struct.unpack(MessageHeader.STRUCT_FORMAT_LE, header_data[:MessageHeader.SIZE])
+        if magic == MessageHeader.MAGIC:
+            endianness = 'little'
     except struct.error as e:
-        log_message(f"Error parsing header: {e}")
-        log_message(f"Header bytes: {header_data[:MessageHeader.SIZE].hex()}")
-        return None
+        pass
+    
+    # If little-endian didn't work, try big-endian
+    if magic != MessageHeader.MAGIC:
+        try:
+            magic, length, checksum = struct.unpack(MessageHeader.STRUCT_FORMAT_BE, header_data[:MessageHeader.SIZE])
+            if magic == MessageHeader.MAGIC:
+                endianness = 'big'
+        except struct.error as e:
+            pass
     
     if magic != MessageHeader.MAGIC:
         log_message(f"Invalid magic number: 0x{magic:08X} (expected 0x{MessageHeader.MAGIC:08X})")
+        log_message(f"Header bytes (hex): {header_data[:MessageHeader.SIZE].hex()}")
+        log_message(f"Header as ASCII: {header_data[:MessageHeader.SIZE].decode('ascii', errors='replace')}")
         return None
     
-    log_message(f"Message header: length={length}, checksum=0x{checksum:08X}")
+    log_message(f"Message header (endianness={endianness}): length={length}, checksum=0x{checksum:08X}")
+    
+    # Sanity check message length
+    if length > MessageHeader.MAX_MESSAGE_SIZE:
+        log_message(f"Message length {length} exceeds maximum allowed size {MessageHeader.MAX_MESSAGE_SIZE}")
+        return None
     
     # Read JSON data
     data = bytearray()
@@ -129,21 +152,23 @@ def read_json_message(ser, timeout=5.0):
             chunk = ser.read(min(ser.in_waiting, length - bytes_read))
             data.extend(chunk)
             bytes_read += len(chunk)
-            log_message(f"Read {len(chunk)} bytes of JSON data ({bytes_read}/{length} total)")
+            if bytes_read % 1000 == 0:  # Log progress every 1000 bytes
+                log_message(f"Read {bytes_read}/{length} bytes ({bytes_read/length*100:.1f}%)")
         else:
             time.sleep(0.01)
     
     # Verify checksum
-    calculated_checksum = sum(data)
+    calculated_checksum = sum(b & 0xFF for b in data)  # Ensure we're only using the lower 8 bits
     if calculated_checksum != checksum:
         log_message(f"Checksum mismatch: expected 0x{checksum:08X}, got 0x{calculated_checksum:08X}")
+        log_message(f"First 100 bytes of data (hex): {data[:100].hex()}")
         return None
     
     # Try to parse JSON
     try:
         json_str = data.decode('utf-8')
         log_message("Successfully decoded JSON string")
-        log_message(f"JSON length: {len(json_str)} characters")
+        log_message(f"JSON starts with: {json_str[:200]}...")
         
         # Parse the JSON
         result = json.loads(json_str)
@@ -162,6 +187,7 @@ def read_json_message(ser, timeout=5.0):
     except UnicodeDecodeError as e:
         log_message(f"Failed to decode JSON as UTF-8: {e}")
         log_message(f"First 100 bytes (hex): {data[:100].hex()}")
+        log_message(f"First 100 bytes (ASCII): {data[:100].decode('ascii', errors='replace')}")
         return None
     except json.JSONDecodeError as e:
         log_message(f"Failed to parse JSON: {e}")
@@ -169,6 +195,8 @@ def read_json_message(ser, timeout=5.0):
         return None
     except Exception as e:
         log_message(f"Unexpected error: {e}")
+        import traceback
+        log_message(traceback.format_exc())
         return None
 
 def read_spectrum(ser):
