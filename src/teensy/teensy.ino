@@ -173,11 +173,8 @@ bool send_spectrum() {
   doc["z_max"] = GRID_Z_MAX;
   
   // Add spectrum data as a flat array
-  JsonArray spectrum_data = doc["spectrum_data"].to<JsonArray>();
+  JsonArray spectrum_data = doc.createNestedArray("spectrum_data");
   int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
-  
-  // Pre-allocate memory for better performance with large arrays
-  spectrum_data.grow(total_points);
   
   // Copy data to JSON array (flatten the 3D array)
   for (int i = 0; i < total_points; i++) {
