@@ -24,13 +24,9 @@ MESSAGE_SEPARATOR = b'\n\n'  # Double newline to separate JSON messages
 # Track if we've logged before in this session
 _first_log = True
 
-# Binary message header format (trying both endianness)
-class MessageHeader:
-    STRUCT_FORMAT_LE = '<III'  # Little-endian
-    STRUCT_FORMAT_BE = '>III'  # Big-endian
-    SIZE = 12  # 3 * 4 bytes
-    MAGIC = 0x4A534F4E  # 'JSON' in ASCII
-    MAX_MESSAGE_SIZE = 100000  # Sanity check for message size
+# MessagePack configuration
+MESSAGEPACK_HEADER_SIZE = 4  # 4-byte length prefix
+MAX_MESSAGE_SIZE = 100000  # Sanity check for message size
 
 def find_teensy_port():
     """Try to find the Teensy by checking common ports or listing all available"""
@@ -80,99 +76,107 @@ def find_magic(ser):
     log_message("Note: find_magic() is not used in JSON mode")
     return False, None
 
-def read_json_message(ser, timeout=5.0):
-    """Read a complete JSON message using binary protocol"""
+def calculate_checksum(message):
+    """Calculate checksum of the message data to verify integrity"""
+    checksum = 0
+    
+    # Add integer fields to checksum
+    checksum += message.get('x_steps', 0) ^ message.get('y_steps', 0) ^ message.get('z_steps', 0)
+    
+    # Add float fields to checksum by interpreting them as bytes
+    for field in ['x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max']:
+        if field in message:
+            # Convert float to bytes and then to integer for checksum
+            float_bytes = struct.pack('!f', message[field])
+            checksum += struct.unpack('!I', float_bytes)[0]
+    
+    # Add spectrum data to checksum
+    if 'spectrum_data' in message and isinstance(message['spectrum_data'], list):
+        for value in message['spectrum_data']:
+            # Convert each float to bytes and add to checksum
+            float_bytes = struct.pack('!f', value)
+            checksum += sum(float_bytes)
+    
+    return checksum & 0xFFFFFFFF  # Ensure 32-bit unsigned
+
+def read_messagepack_message(ser, timeout=5.0):
+    """Read a MessagePack message with length prefix and verify checksum"""
     import struct
     
     start_time = time.time()
-    header_data = bytearray()
     
-    log_message("Waiting for message header...")
-    
-    # Read header
-    while len(header_data) < MessageHeader.SIZE:
+    # Read the 4-byte length prefix (big-endian)
+    length_data = bytearray()
+    while len(length_data) < MESSAGEPACK_HEADER_SIZE:
         if time.time() - start_time > timeout:
-            log_message("Timeout waiting for message header")
-            log_message(f"Current header data (hex): {header_data.hex()}")
+            log_message("Timeout waiting for message length")
             return None
             
         if ser.in_waiting > 0:
             chunk = ser.read(ser.in_waiting)
-            header_data.extend(chunk)
-            log_message(f"Read {len(chunk)} bytes of header data")
+            length_data.extend(chunk)
+            log_message(f"Read {len(chunk)} bytes of length data")
         else:
             time.sleep(0.01)
     
-    # Try parsing with both endianness
-    magic, length, checksum = None, None, None
-    endianness = None
-    
-    # Try little-endian first
-    try:
-        magic, length, checksum = struct.unpack(MessageHeader.STRUCT_FORMAT_LE, header_data[:MessageHeader.SIZE])
-        if magic == MessageHeader.MAGIC:
-            endianness = 'little'
-    except struct.error as e:
-        pass
-    
-    # If little-endian didn't work, try big-endian
-    if magic != MessageHeader.MAGIC:
-        try:
-            magic, length, checksum = struct.unpack(MessageHeader.STRUCT_FORMAT_BE, header_data[:MessageHeader.SIZE])
-            if magic == MessageHeader.MAGIC:
-                endianness = 'big'
-        except struct.error as e:
-            pass
-    
-    if magic != MessageHeader.MAGIC:
-        log_message(f"Invalid magic number: 0x{magic:08X} (expected 0x{MessageHeader.MAGIC:08X})")
-        log_message(f"Header bytes (hex): {header_data[:MessageHeader.SIZE].hex()}")
-        log_message(f"Header as ASCII: {header_data[:MessageHeader.SIZE].decode('ascii', errors='replace')}")
+    if len(length_data) < MESSAGEPACK_HEADER_SIZE:
+        log_message(f"Incomplete length data: {len(length_data)} bytes")
         return None
     
-    log_message(f"Message header (endianness={endianness}): length={length}, checksum=0x{checksum:08X}")
+    # Unpack the 4-byte big-endian length
+    try:
+        msg_length = struct.unpack('>I', length_data[:MESSAGEPACK_HEADER_SIZE])[0]
+        log_message(f"Message length: {msg_length} bytes")
+    except struct.error as e:
+        log_message(f"Error unpacking message length: {e}")
+        log_message(f"Length bytes (hex): {length_data.hex()}")
+        return None
     
     # Sanity check message length
-    if length > MessageHeader.MAX_MESSAGE_SIZE:
-        log_message(f"Message length {length} exceeds maximum allowed size {MessageHeader.MAX_MESSAGE_SIZE}")
+    if msg_length > MAX_MESSAGE_SIZE:
+        log_message(f"Message length {msg_length} exceeds maximum allowed size {MAX_MESSAGE_SIZE}")
         return None
     
-    # Read JSON data
+    # Read the message data
     data = bytearray()
     bytes_read = 0
     
-    log_message(f"Reading {length} bytes of JSON data...")
+    log_message(f"Reading {msg_length} bytes of MessagePack data...")
     
-    while bytes_read < length:
+    while bytes_read < msg_length:
         if time.time() - start_time > timeout:
-            log_message(f"Timeout reading JSON data (got {bytes_read}/{length} bytes)")
+            log_message(f"Timeout reading MessagePack data (got {bytes_read}/{msg_length} bytes)")
             return None
             
         if ser.in_waiting > 0:
-            chunk = ser.read(min(ser.in_waiting, length - bytes_read))
+            chunk = ser.read(min(ser.in_waiting, msg_length - bytes_read))
             data.extend(chunk)
             bytes_read += len(chunk)
-            if bytes_read % 1000 == 0:  # Log progress every 1000 bytes
-                log_message(f"Read {bytes_read}/{length} bytes ({bytes_read/length*100:.1f}%)")
+            if msg_length > 1000 and bytes_read % 1000 == 0:  # Log progress for large messages
+                log_message(f"Read {bytes_read}/{msg_length} bytes ({bytes_read/msg_length*100:.1f}%)")
         else:
             time.sleep(0.01)
     
-    # Verify checksum
-    calculated_checksum = sum(b & 0xFF for b in data)  # Ensure we're only using the lower 8 bits
-    if calculated_checksum != checksum:
-        log_message(f"Checksum mismatch: expected 0x{checksum:08X}, got 0x{calculated_checksum:08X}")
-        log_message(f"First 100 bytes of data (hex): {data[:100].hex()}")
+    if bytes_read != msg_length:
+        log_message(f"Incomplete message: expected {msg_length} bytes, got {bytes_read}")
         return None
     
-    # Try to parse JSON
+    # Try to unpack the MessagePack data
     try:
-        json_str = data.decode('utf-8')
-        log_message("Successfully decoded JSON string")
-        log_message(f"JSON starts with: {json_str[:200]}...")
+        result = msgpack.unpackb(data, raw=False)
+        log_message("Successfully unpacked MessagePack message")
         
-        # Parse the JSON
-        result = json.loads(json_str)
-        log_message("Successfully parsed JSON message")
+        # Verify checksum if present
+        if 'checksum' in result:
+            received_checksum = result['checksum']
+            calculated_checksum = calculate_checksum(result)
+            
+            if received_checksum != calculated_checksum:
+                log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
+                return None
+            log_message("Checksum verified successfully")
+        else:
+            log_message("Warning: No checksum found in message")
         
         # Log some basic info about the data
         if isinstance(result, dict):
@@ -184,67 +188,29 @@ def read_json_message(ser, timeout=5.0):
         
         return result
         
-    except UnicodeDecodeError as e:
-        log_message(f"Failed to decode JSON as UTF-8: {e}")
+    except Exception as e:
+        log_message(f"Failed to unpack MessagePack data: {e}")
         log_message(f"First 100 bytes (hex): {data[:100].hex()}")
         log_message(f"First 100 bytes (ASCII): {data[:100].decode('ascii', errors='replace')}")
-        return None
-    except json.JSONDecodeError as e:
-        log_message(f"Failed to parse JSON: {e}")
-        log_message(f"JSON content (first 200 chars): {data[:200].decode('utf-8', errors='replace')}")
-        return None
-    except Exception as e:
-        log_message(f"Unexpected error: {e}")
         import traceback
         log_message(traceback.format_exc())
         return None
 
 def read_spectrum(ser):
-    """Read a complete spectrum data packet in JSON format"""
-    try:
-        # Read a complete JSON message
-        data = read_json_message(ser)
-        if not data:
-            log_message("Failed to read valid JSON message")
-            return None
-            
-        # Extract and validate required fields
-        required_fields = ['x_steps', 'y_steps', 'z_steps', 
-                          'x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max',
-                          'spectrum_data']
-                          
-        for field in required_fields:
-            if field not in data:
-                log_message(f"Missing required field in JSON: {field}")
+    """Read a complete spectrum data message from the serial port"""
+    message = read_messagepack_message(ser)
+    if message and 'spectrum_data' in message:
+        # Add timestamp to the message
+        message['timestamp'] = datetime.now()
+        
+        # Validate spectrum data if dimensions are provided
+        if all(key in message for key in ['x_steps', 'y_steps', 'z_steps']):
+            expected_length = message['x_steps'] * message['y_steps'] * message['z_steps']
+            if len(message['spectrum_data']) != expected_length:
+                log_message(f"Spectrum data length mismatch: expected {expected_length}, got {len(message['spectrum_data'])}")
                 return None
-                
-        # Convert spectrum data to numpy array
-        try:
-            spectrum = np.array(data['spectrum_data'], dtype=np.float32)
-            expected_size = data['x_steps'] * data['y_steps'] * data['z_steps']
-            
-            if len(spectrum) != expected_size:
-                log_message(f"Spectrum data size mismatch. Expected {expected_size}, got {len(spectrum)}")
-                return None
-                
-            # Reshape the spectrum data
-            spectrum = spectrum.reshape((data['x_steps'], data['y_steps'], data['z_steps']))
-            
-            return {
-                'x': np.linspace(data['x_min'], data['x_max'], data['x_steps']),
-                'y': np.linspace(data['y_min'], data['y_max'], data['y_steps']),
-                'z': np.linspace(data['z_min'], data['z_max'], data['z_steps']),
-                'spectrum': spectrum,
-                'timestamp': datetime.now()
-            }
-            
-        except Exception as e:
-            log_message(f"Error processing spectrum data: {e}")
-            return None
-            
-    except Exception as e:
-        log_message(f"Error in read_spectrum: {e}")
-        return None
+        return message
+    return None
 
 def plot_spectrum(spectrum_data, output_dir, plot_number):
     """Create and save a visualization of the spectrum"""

@@ -2,7 +2,7 @@
 #include <arm_math.h>
 #include "linalg.h"
 #include "AudioFilterSPH0645.h"
-#include <ArduinoJson.h>
+#include <MsgPacketizer.h>
 
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
@@ -135,19 +135,6 @@ void loop() {
   }
 }
 
-
-struct SpectrumHeader {
-  uint32_t magic;         // 'MUSI' as 32-bit value
-  uint32_t x_steps;       // Number of steps in X dimension
-  uint32_t y_steps;       // Number of steps in Y dimension
-  uint32_t z_steps;       // Number of steps in Z dimension
-  float x_min, x_max;     // X dimension bounds
-  float y_min, y_max;     // Y dimension bounds
-  float z_min, z_max;     // Z dimension bounds
-  uint32_t data_size;     // Total number of floats in the spectrum data
-  uint32_t checksum;      // Simple checksum of the header
-};
-
 // Calculate a simple checksum for the header
 uint32_t calculate_checksum(const uint8_t* data, size_t length) {
   uint32_t sum = 0;
@@ -157,33 +144,68 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
   return sum;
 }
 
-// Binary message header
-struct MessageHeader {
-  uint32_t magic;      // Magic number to identify the start of a message
-  uint32_t length;     // Length of the JSON data
-  uint32_t checksum;   // Simple checksum of the JSON data
+// MessagePack buffer
+const size_t MSGPACK_BUFFER_SIZE = 4096;
+uint8_t msgpack_buffer[MSGPACK_BUFFER_SIZE];
+
+// Message structure for spectrum data
+struct SpectrumMessage {
+  uint32_t x_steps;
+  uint32_t y_steps;
+  uint32_t z_steps;
+  float x_min, x_max;
+  float y_min, y_max;
+  float z_min, z_max;
+  uint32_t checksum;  // Checksum of the spectrum data
+  float spectrum_data[GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS];
+  
+  // This method tells MsgPacketizer how to serialize this structure
+  MSGPACK_DEFINE(
+    x_steps, y_steps, z_steps,
+    x_min, x_max,
+    y_min, y_max,
+    z_min, z_max,
+    checksum,
+    spectrum_data
+  );
+  
+  // Calculate checksum of the spectrum data
+  uint32_t calculate_checksum() {
+    uint32_t sum = 0;
+    const uint8_t* data = (const uint8_t*)spectrum_data;
+    size_t data_size = sizeof(spectrum_data);
+    
+    for (size_t i = 0; i < data_size; i++) {
+      sum += data[i];
+    }
+    
+    // Add other fields to the checksum
+    sum += x_steps ^ y_steps ^ z_steps;
+    sum += *((uint32_t*)&x_min) + *((uint32_t*)&x_max);
+    sum += *((uint32_t*)&y_min) + *((uint32_t*)&y_max);
+    sum += *((uint32_t*)&z_min) + *((uint32_t*)&z_max);
+    
+    return sum;
+  }
 };
 
+// Global message instance
+SpectrumMessage spectrum_msg;
+
 bool send_spectrum() {
-  // Create a JSON document
-  JsonDocument doc;
+  // Fill in the message structure
+  spectrum_msg.x_steps = GRID_X_STEPS;
+  spectrum_msg.y_steps = GRID_Y_STEPS;
+  spectrum_msg.z_steps = GRID_Z_STEPS;
+  spectrum_msg.x_min = GRID_X_MIN;
+  spectrum_msg.x_max = GRID_X_MAX;
+  spectrum_msg.y_min = GRID_Y_MIN;
+  spectrum_msg.y_max = GRID_Y_MAX;
+  spectrum_msg.z_min = GRID_Z_MIN;
+  spectrum_msg.z_max = GRID_Z_MAX;
   
-  // Add metadata
-  doc["x_steps"] = GRID_X_STEPS;
-  doc["y_steps"] = GRID_Y_STEPS;
-  doc["z_steps"] = GRID_Z_STEPS;
-  doc["x_min"] = GRID_X_MIN;
-  doc["x_max"] = GRID_X_MAX;
-  doc["y_min"] = GRID_Y_MIN;
-  doc["y_max"] = GRID_Y_MAX;
-  doc["z_min"] = GRID_Z_MIN;
-  doc["z_max"] = GRID_Z_MAX;
-  
-  // Add spectrum data as a flat array
-  JsonArray spectrum_data = doc.createNestedArray("spectrum_data");
+  // Copy spectrum data to the message structure
   int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
-  
-  // Copy data to JSON array (flatten the 3D array)
   for (int i = 0; i < total_points; i++) {
     int x = i % GRID_X_STEPS;
     int y = (i / GRID_X_STEPS) % GRID_Y_STEPS;
@@ -191,45 +213,44 @@ bool send_spectrum() {
     
     // Convert 3D index to 1D index in the music_spectrum array
     int idx = x + GRID_X_STEPS * (y + GRID_Y_STEPS * z);
-    spectrum_data.add(music_spectrum[idx]);
+    spectrum_msg.spectrum_data[i] = music_spectrum[idx];
   }
   
-  // Serialize JSON to a string
-  String json_string;
-  serializeJson(doc, json_string);
+  // Calculate and set the checksum after all data is copied
+  spectrum_msg.checksum = spectrum_msg.calculate_checksum();
   
-  // Calculate checksum
-  uint32_t checksum = 0;
-  for (size_t i = 0; i < json_string.length(); i++) {
-    checksum += (uint8_t)json_string[i];
+  // Serialize the message to MessagePack format
+  size_t len = MsgPacketizer::encode(
+    msgpack_buffer, MSGPACK_BUFFER_SIZE,  // Buffer and its size
+    spectrum_msg                          // The data to serialize
+  );
+  
+  if (len == 0) {
+    // Serialization failed
+    return false;
   }
   
-  // Prepare message header
-  MessageHeader header;
-  header.magic = 0x4A534F4E;  // 'JSON' in ASCII
-  header.length = json_string.length();
-  header.checksum = checksum;
+  // First send the message length (4 bytes, big-endian)
+  uint32_t msg_len = len;
+  uint8_t len_bytes[4];
+  len_bytes[0] = (msg_len >> 24) & 0xFF;
+  len_bytes[1] = (msg_len >> 16) & 0xFF;
+  len_bytes[2] = (msg_len >> 8) & 0xFF;
+  len_bytes[3] = msg_len & 0xFF;
   
-  // Send header
-  Serial1.write((const uint8_t*)&header, sizeof(header));
+  Serial1.write(len_bytes, 4);
   
-  // Send JSON data
+  // Then send the MessagePack data in chunks to avoid blocking
   size_t bytes_written = 0;
-  const char* json_data = json_string.c_str();
-  
-  // Write in chunks to avoid blocking
-  while (bytes_written < header.length) {
-    size_t chunk_size = min(64, (int)(header.length - bytes_written));
-    size_t written = Serial1.write(json_data + bytes_written, chunk_size);
+  while (bytes_written < len) {
+    size_t chunk_size = min(64, (int)(len - bytes_written));
+    size_t written = Serial1.write(msgpack_buffer + bytes_written, chunk_size);
     if (written == 0) {
       // Write failed
       return false;
     }
     bytes_written += written;
   }
-  
-  // Send a newline for good measure (optional)
-  Serial1.write('\n');
   
   return true;
 }
