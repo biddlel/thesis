@@ -225,24 +225,28 @@ bool send_spectrum() {
     // Calculate and set checksum
     spectrum_msg.checksum = calculate_checksum(spectrum_msg);
     
-    // Create a packetizer instance
-    static auto packet = MsgPacketizer::encodeTo(buffer, BUFFER_SIZE);
-    
-    // Clear previous data
-    packet.clear();
-    
-    // Add all data to the packet
-    packet << spectrum_msg.x_steps
-           << spectrum_msg.y_steps
-           << spectrum_msg.x_min
-           << spectrum_msg.x_max
-           << spectrum_msg.y_min
-           << spectrum_msg.y_max
-           << spectrum_msg.spectrum_data
-           << spectrum_msg.checksum;
+    // Encode the message using MsgPacketizer
+    const auto& packet = MsgPacketizer::encode(0,  // packet ID
+        spectrum_msg.x_steps,
+        spectrum_msg.y_steps,
+        spectrum_msg.x_min,
+        spectrum_msg.x_max,
+        spectrum_msg.y_min,
+        spectrum_msg.y_max,
+        spectrum_msg.spectrum_data,
+        spectrum_msg.checksum
+    );
     
     // Get the encoded data size
-    size_t msg_len = packet.size();
+    size_t msg_len = packet.data.size();
+    
+    // Check if the message fits in our buffer
+    if (msg_len > BUFFER_SIZE) {
+        return false;  // Message too large for buffer
+    }
+    
+    // Copy the encoded data to our buffer
+    memcpy(buffer, packet.data.data(), msg_len);
     
     // Send the message with 4-byte length prefix (big-endian)
     uint8_t len_bytes[4] = {
