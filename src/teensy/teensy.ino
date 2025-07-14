@@ -238,15 +238,16 @@ bool send_spectrum() {
     );
     
     // Get the encoded data size
-    size_t msg_len = packet.data.size();
+    size_t msg_len = packet.size();
+    Serial.println(msg_len);
     
     // Check if the message fits in our buffer
     if (msg_len > BUFFER_SIZE) {
         return false;  // Message too large for buffer
     }
     
-    // Copy the encoded data to our buffer
-    memcpy(buffer, packet.data.data(), msg_len);
+    // Get a pointer to the encoded data
+    const uint8_t* data_ptr = packet.data();
     
     // Send the message with 4-byte length prefix (big-endian)
     uint8_t len_bytes[4] = {
@@ -256,20 +257,25 @@ bool send_spectrum() {
         (uint8_t)(msg_len & 0xFF)
     };
     
-    // Send length prefix
+    // Send the length prefix
+    Serial1.write(0x1F);  // Start of message marker
     Serial1.write(len_bytes, 4);
     
-    // Send message in chunks
-    size_t bytes_sent = 0;
-    while (bytes_sent < msg_len) {
-        size_t chunk_size = min(64, (int)(msg_len - bytes_sent));
-        size_t written = Serial1.write(buffer + bytes_sent, chunk_size);
-        if (written == 0) {
-            delay(1);
-            continue;
-        }
-        bytes_sent += written;
+    // Send the message in chunks to avoid blocking
+    const size_t CHUNK_SIZE = 64;
+    size_t bytes_remaining = msg_len;
+    
+    while (bytes_remaining > 0) {
+        size_t chunk_size = min(bytes_remaining, CHUNK_SIZE);
+        Serial1.write(data_ptr, chunk_size);
+        data_ptr += chunk_size;
+        bytes_remaining -= chunk_size;
     }
+    
+    // Add an end of message marker
+    Serial1.write(0x1E);  // End of message marker
+    Serial1.flush();  // Ensure all data is sent
+    delay(1);
     
     return true;
 }

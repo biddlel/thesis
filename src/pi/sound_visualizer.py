@@ -82,25 +82,48 @@ def calculate_checksum(message):
     import struct
     checksum = 0
     
-    # Add header values to checksum
-    checksum += message[b'x_steps'] ^ message[b'y_steps']
-    
-    # Add float values
-    for field in [b'x_min', b'x_max', b'y_min', b'y_max']:
-        float_val = struct.unpack('!f', message[field])[0]
-        checksum += struct.unpack('!I', struct.pack('!f', float_val))[0]
-    
-    # Add 2D spectrum data to checksum
-    if b'spectrum_data' in message:
-        for row in message[b'spectrum_data']:
-            for value in row:
-                checksum += struct.unpack('!I', struct.pack('!f', value))[0]
+    if isinstance(message, dict):
+        # Dictionary format
+        x_steps = message.get('x_steps', 0) if isinstance(message.get('x_steps'), int) else 0
+        y_steps = message.get('y_steps', 0) if isinstance(message.get('y_steps'), int) else 0
+        checksum += x_steps ^ y_steps
+        
+        # Add float values
+        for field in ['x_min', 'x_max', 'y_min', 'y_max']:
+            if field in message and isinstance(message[field], (int, float)):
+                # Convert to bytes and back to get consistent bit pattern
+                float_val = float(message[field])
+                checksum += struct.unpack('!I', struct.pack('!f', float_val))[0]
+        
+        # Add 2D spectrum data to checksum
+        if 'spectrum_data' in message and isinstance(message['spectrum_data'], (list, tuple)):
+            for row in message['spectrum_data']:
+                if not isinstance(row, (list, tuple)):
+                    continue
+                for value in row:
+                    if isinstance(value, (int, float)):
+                        checksum += struct.unpack('!I', struct.pack('!f', float(value)))[0]
     
     return checksum & 0xFFFFFFFF  # Ensure 32-bit unsigned
 
 def read_msgpacketizer_message(ser, timeout=5.0):
-    """Read a MsgPacketizer message with length prefix and verify checksum"""
+    """Read a MsgPacketizer message with start/end markers and length prefix"""
     start_time = time.time()
+    
+    # Wait for start of message marker (0x1F)
+    while True:
+        if time.time() - start_time > timeout:
+            log_message("Timeout waiting for start of message")
+            return None
+            
+        if ser.in_waiting > 0:
+            marker = ser.read(1)[0]
+            if marker == 0x1F:  # Start of message marker
+                break
+            elif marker != 0x1F:
+                log_message(f"Unexpected byte 0x{marker:02x}, expected start marker 0x1F")
+                # Skip this byte and continue looking for start marker
+                continue
     
     # Read the 4-byte length prefix (big-endian)
     length_data = bytearray()
@@ -130,7 +153,6 @@ def read_msgpacketizer_message(ser, timeout=5.0):
     
     # Sanity check message length
     if msg_length > MAX_MESSAGE_SIZE or msg_length == 0:
-        log_message(f"Invalid message length: {msg_length}")
         return None
     
     # Read the message data
@@ -141,18 +163,26 @@ def read_msgpacketizer_message(ser, timeout=5.0):
     
     while bytes_read < msg_length:
         if time.time() - start_time > timeout:
-            log_message(f"Timeout reading MsgPack data (got {bytes_read}/{msg_length} bytes)")
+            log_message(f"Timeout reading message data. Got {bytes_read} of {msg_length} bytes")
             return None
             
-        if ser.in_waiting > 0:
-            chunk = ser.read(min(ser.in_waiting, msg_length - bytes_read))
-            data.extend(chunk)
-            bytes_read += len(chunk)
-            if msg_length > 1000 and bytes_read % 1000 == 0:  # Log progress for large messages
-                log_message(f"Read {bytes_read}/{msg_length} bytes ({bytes_read/msg_length*100:.1f}%)")
-        else:
-            time.sleep(0.01)
+        chunk = ser.read(min(ser.in_waiting, msg_length - bytes_read))
+        if not chunk:
+            time.sleep(0.001)
+            continue
+            
+        data.extend(chunk)
+        bytes_read += len(chunk)
+        
+        if msg_length > 1000 and bytes_read % 1000 == 0:  # Log progress for large messages
+            log_message(f"Read {bytes_read}/{msg_length} bytes ({bytes_read/msg_length*100:.1f}%)")
     
+    # Read and verify end of message marker (0x1E)
+    end_marker = ser.read(1)
+    if not end_marker or end_marker[0] != 0x1E:
+        log_message(f"Missing or invalid end marker. Got: {end_marker.hex() if end_marker else 'None'}")
+        return None
+        
     if bytes_read != msg_length:
         log_message(f"Incomplete message: expected {msg_length} bytes, got {bytes_read}")
         return None
@@ -161,44 +191,39 @@ def read_msgpacketizer_message(ser, timeout=5.0):
     try:
         # First try to unpack as a standard message
         try:
-            result = msgpack.unpackb(data, raw=True, strict_map_key=False)
+            result = msgpack.unpackb(data, raw=False, strict_map_key=False)
             log_message("Successfully unpacked MsgPack message")
+            
+            # MsgPacketizer sends data as an array, convert to dict
+            if isinstance(result, list):
+                keys = ['x_steps', 'y_steps', 'x_min', 'x_max', 'y_min', 'y_max', 'spectrum_data', 'checksum']
+                result = dict(zip(keys, result))
+                log_message("Converted array to dictionary format")
+            
+            # Convert bytes keys to strings for easier handling if needed
+            if isinstance(result, dict):
+                result = {k.decode() if isinstance(k, bytes) else k: v for k, v in result.items()}
+                
+                # Verify checksum if present
+                if 'checksum' in result:
+                    # Make a copy of the result and remove checksum for calculation
+                    checksum_data = result.copy()
+                    received_checksum = checksum_data.pop('checksum')
+                    
+                    # Calculate checksum of the data
+                    calculated_checksum = calculate_checksum(checksum_data)
+                    
+                    if received_checksum != calculated_checksum:
+                        log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
+                        return None
+                    log_message("Checksum verified successfully")
+                
+                return result
+            
         except Exception as e:
             log_message(f"Failed to unpack MsgPack data: {e}")
+            log_message(f"Raw data (hex): {data.hex()}")
             return None
-        
-        # Convert bytes keys to strings for easier handling
-        result = {k.decode() if isinstance(k, bytes) else k: v for k, v in result.items()}
-        
-        # Verify checksum if present
-        if 'checksum' in result:
-            # Make a copy of the result and remove checksum for calculation
-            checksum_data = result.copy()
-            received_checksum = checksum_data.pop('checksum')
-            
-            # Convert back to bytes for checksum calculation
-            checksum_data_bytes = {}
-            for k, v in checksum_data.items():
-                if isinstance(k, str):
-                    k = k.encode()
-                checksum_data_bytes[k] = v
-            
-            calculated_checksum = calculate_checksum(checksum_data_bytes)
-            
-            if received_checksum != calculated_checksum:
-                log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
-                return None
-            log_message("Checksum verified successfully")
-        else:
-            log_message("Warning: No checksum found in message")
-        
-        # Log some basic info about the data
-        log_message(f"Message keys: {list(result.keys())}")
-        if 'spectrum_data' in result and isinstance(result['spectrum_data'], list):
-            log_message(f"Spectrum data dimensions: {len(result['spectrum_data'])}x{len(result['spectrum_data'][0]) if result['spectrum_data'] else 0}")
-        
-        return result
-        
     except Exception as e:
         log_message(f"Failed to process message: {e}")
         if data:
