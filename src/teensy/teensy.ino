@@ -33,20 +33,6 @@ struct SoundSources {
 // Global instance
 SoundSources sound_sources_msg;
 
-// Structure to hold spectrum data for sound source detection
-struct SpectrumData {
-    std::vector<std::vector<float>> spectrum_data;
-    
-    // Add minimal required members for compatibility
-    uint32_t x_steps = 0;
-    uint32_t y_steps = 0;
-    float x_min = 0, x_max = 0;
-    float y_min = 0, y_max = 0;
-};
-
-// Global instance
-SpectrumData spectrum_msg;
-
 // --- Configuration Constants ---
 const float SAMPLE_RATE = AUDIO_SAMPLE_RATE_EXACT;
 const int FFT_SIZE = 1024;
@@ -193,7 +179,7 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 
 // Function to detect sound sources from 3D spectrum data
 void detect_sound_sources(SoundSources& sources) {
-    const float THRESHOLD = 0.5f;  // Minimum intensity threshold (0.0 to 1.0)
+    const float THRESHOLD = 0.2f;  // Minimum intensity threshold (0.0 to 1.0)
     const float MIN_DISTANCE = 0.1f; // Minimum distance between sources (normalized)
     
     // Reset sources
@@ -341,11 +327,6 @@ void run_music_algorithm() {
     music_spectrum[i] = 0.0;
   }
   
-  // Initialize spectrum data structure for sound source detection
-  spectrum_msg.spectrum_data.resize(GRID_Y_STEPS);
-  for (int y = 0; y < GRID_Y_STEPS; y++) {
-    spectrum_msg.spectrum_data[y].resize(GRID_X_STEPS);
-  }
 
   // 3. Iterate over frequency bins to build the broadband spectrum
   for (int k = START_FREQ_BIN; k < END_FREQ_BIN; ++k) {
