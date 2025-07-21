@@ -3,23 +3,25 @@
 #include <SPI.h>
 
 // Audio setup
-AudioInputI2S            i2s1;
+AudioInputI2S            i2s1;  // I2S input for mics 1 & 2
+AudioInputI2S            i2s2;  // I2S input for mics 3 & 4
 AudioRecordQueue         queue1;
 AudioRecordQueue         queue2;
 AudioRecordQueue         queue3;
 AudioRecordQueue         queue4;
 
-// Audio connections - Using I2S inputs 0-3 for 4 microphones
-AudioConnection          patchCord1(i2s1, 0, queue1, 0);  // Mic 1 Left
-AudioConnection          patchCord2(i2s1, 1, queue2, 0);  // Mic 1 Right
-AudioConnection          patchCord3(i2s1, 2, queue3, 0);  // Mic 2 Left
-AudioConnection          patchCord4(i2s1, 3, queue4, 0);  // Mic 2 Right
+// Audio connections - Each I2S has 2 channels (left and right)
+// Using separate I2S interfaces for better channel separation
+AudioConnection          patchCord1(i2s1, 0, queue1, 0);  // Mic 1 (left channel of i2s1)
+AudioConnection          patchCord2(i2s1, 1, queue2, 0);  // Mic 2 (right channel of i2s1)
+AudioConnection          patchCord3(i2s2, 0, queue3, 0);  // Mic 3 (left channel of i2s2)
+AudioConnection          patchCord4(i2s2, 1, queue4, 0);  // Mic 4 (right channel of i2s2)
 
 // Microphone array configuration
 const int NUM_MICS = 4;                     // Number of microphones
 const int SAMPLE_RATE = 44100;              // Audio sample rate (Hz)
 const int SAMPLES_PER_BLOCK = 128;          // Audio block size
-const int CHANNELS_PER_MIC = 2;             // I2S has 2 channels per mic
+const int CHANNELS_PER_MIC = 1;             // I2S has 1 channel per mic
 
 // Microphone positions (in mm)
 struct MicCoordinate { 
@@ -55,7 +57,7 @@ void setup() {
     // Wait for serial port to connect (up to 4 seconds)
     while (!Serial && millis() < 4000) {}
     
-    // Allocate audio memory (60 blocks should be enough for 4 channels)
+    // Allocate audio memory (increase if needed for 4 channels)
     AudioMemory(60);
     
     // Initialize audio queues
@@ -77,7 +79,7 @@ void setup() {
     Serial.println(" Hz");
     Serial.print("Samples per block: ");
     Serial.println(SAMPLES_PER_BLOCK);
-    Serial.println("Ready!");
+    Serial.println("Ready!\n");
 }
 
 void loop() {
@@ -96,11 +98,11 @@ void loop() {
         // Copy samples to our buffer
         for (int i = 0; i < SAMPLES_PER_BLOCK; i++) {
             if (sample_count < BUFFER_SIZE) {
-                // For each mic, we take the average of left and right channels
-                audio_buffer[0][sample_count] = (block1[i*2] + block1[i*2+1]) / 2;  // Mic 1
-                audio_buffer[1][sample_count] = (block2[i*2] + block2[i*2+1]) / 2;  // Mic 2
-                audio_buffer[2][sample_count] = (block3[i*2] + block3[i*2+1]) / 2;  // Mic 3
-                audio_buffer[3][sample_count] = (block4[i*2] + block4[i*2+1]) / 2;  // Mic 4
+                // Each queue provides one channel of audio data
+                audio_buffer[0][sample_count] = block1[i];  // Mic 1
+                audio_buffer[1][sample_count] = block2[i];  // Mic 2
+                audio_buffer[2][sample_count] = block3[i];  // Mic 3
+                audio_buffer[3][sample_count] = block4[i];  // Mic 4
                 
                 sample_count++;
                 
