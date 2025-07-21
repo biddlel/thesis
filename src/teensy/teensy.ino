@@ -3,6 +3,14 @@
 #include "linalg.h"
 // Simple binary protocol for spectrum data
 
+// Buffer for serial communication
+const size_t BUFFER_SIZE = 4096;  // Buffer size for serial communication
+uint8_t buffer[BUFFER_SIZE];
+
+// Protocol constants
+const uint8_t START_MARKER = 0x1F;
+const uint8_t END_MARKER = 0x1E;
+
 #define DEBUGLOG_DEFAULT_LOG_LEVEL DEBUGLOG_LEVEL_WARN
 #define ARDUINOJSON_USE_LONG_LONG 1
 #define ARDUINOJSON_USE_DOUBLE 1
@@ -20,25 +28,20 @@ struct SoundSources {
     uint8_t count;  // Number of sources (max 255)
     SoundSource sources[10]; // Fixed size array for simplicity
     uint32_t checksum;
-    
-    // This method tells MsgPacketizer how to serialize the data
-    MSGPACK_DEFINE(count, sources, checksum);
 };
 
 // Global instance
 SoundSources sound_sources_msg;
 
-// Structure to hold spectrum data
+// Structure to hold spectrum data for sound source detection
 struct SpectrumData {
-    uint32_t x_steps;
-    uint32_t y_steps;
-    float x_min, x_max;
-    float y_min, y_max;
     std::vector<std::vector<float>> spectrum_data;
-    uint32_t checksum;
     
-    // This method tells MsgPacketizer how to serialize the data
-    MSGPACK_DEFINE(x_steps, y_steps, x_min, x_max, y_min, y_max, spectrum_data, checksum);
+    // Add minimal required members for compatibility
+    uint32_t x_steps = 0;
+    uint32_t y_steps = 0;
+    float x_min = 0, x_max = 0;
+    float y_min = 0, y_max = 0;
 };
 
 // Global instance
@@ -184,47 +187,93 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
   return sum;
 }
 
-// Buffer for serial communication
-const size_t BUFFER_SIZE = 4096;  // Buffer size for serial communication
-uint8_t buffer[BUFFER_SIZE];
+// Simple checksum calculation for sound sources
 
-// Protocol constants
-const uint8_t START_MARKER = 0x1F;
-const uint8_t END_MARKER = 0x1E;
-
-// Calculate checksum of the spectrum data
-uint32_t calculate_checksum(const SpectrumData& data) {
-    uint32_t checksum = 0;
+// Function to detect sound sources from 3D spectrum data
+void detect_sound_sources(const SpectrumData& spectrum, SoundSources& sources) {
+    const float THRESHOLD = 0.5f;  // Minimum intensity threshold (0.0 to 1.0)
+    const float MIN_DISTANCE = 0.1f; // Minimum distance between sources (normalized)
     
-    // Add header values to checksum
-    checksum += data.x_steps ^ data.y_steps;
+    // Reset sources
+    sources.count = 0;
     
-    // Add float values
-    uint32_t* x_min_ptr = (uint32_t*)&data.x_min;
-    uint32_t* x_max_ptr = (uint32_t*)&data.x_max;
-    uint32_t* y_min_ptr = (uint32_t*)&data.y_min;
-    uint32_t* y_max_ptr = (uint32_t*)&data.y_max;
-    
-    checksum += *x_min_ptr + *x_max_ptr + *y_min_ptr + *y_max_ptr;
-    
-    // Add 2D spectrum data to checksum
-    for (const auto& row : data.spectrum_data) {
-        for (float value : row) {
-            uint32_t* val_ptr = (uint32_t*)&value;
-            checksum += *val_ptr;
+    // Find local maxima in 3D spectrum
+    for (int z = 1; z < GRID_Z_STEPS - 1; z++) {
+        for (int y = 1; y < GRID_Y_STEPS - 1; y++) {
+            for (int x = 1; x < GRID_X_STEPS - 1; x++) {
+                float val = music_spectrum[gridToIndex(x, y, z)];
+                
+                // Skip if below threshold
+                if (val < THRESHOLD) continue;
+                
+                // Check if this is a local maximum in 3D space
+                bool is_local_max = true;
+                for (int dz = -1; dz <= 1 && is_local_max; dz++) {
+                    for (int dy = -1; dy <= 1 && is_local_max; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            if (dx == 0 && dy == 0 && dz == 0) continue;
+                            if (music_spectrum[gridToIndex(x+dx, y+dy, z+dz)] >= val) {
+                                is_local_max = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if (!is_local_max) continue;
+                
+                // Convert grid position to coordinates
+                float x_pos = GRID_X_MIN + (x / (float)(GRID_X_STEPS - 1)) * (GRID_X_MAX - GRID_X_MIN);
+                float y_pos = GRID_Y_MIN + (y / (float)(GRID_Y_STEPS - 1)) * (GRID_Y_MAX - GRID_Y_MIN);
+                
+                // Check if this source is too close to existing ones
+                bool too_close = false;
+                for (uint8_t i = 0; i < sources.count; i++) {
+                    float dx = x_pos - sources.sources[i].x;
+                    float dy = y_pos - sources.sources[i].y;
+                    float dist = sqrtf(dx*dx + dy*dy);
+                    
+                    if (dist < MIN_DISTANCE) {
+                        // Keep the stronger source
+                        if (val > sources.sources[i].strength) {
+                            sources.sources[i].x = x_pos;
+                            sources.sources[i].y = y_pos;
+                            sources.sources[i].strength = val;
+                        }
+                        too_close = true;
+                        break;
+                    }
+                }
+                
+                // Add as new source if not too close to existing ones
+                if (!too_close && sources.count < 10) {
+                    sources.sources[sources.count].x = x_pos;
+                    sources.sources[sources.count].y = y_pos;
+                    sources.sources[sources.count].strength = val;
+                    sources.count++;
+                }
+            }
         }
     }
     
-    return checksum;
+    // Sort sources by strength (strongest first)
+    for (uint8_t i = 0; i < sources.count; i++) {
+        for (uint8_t j = i + 1; j < sources.count; j++) {
+            if (sources.sources[i].strength < sources.sources[j].strength) {
+                SoundSource temp = sources.sources[i];
+                sources.sources[i] = sources.sources[j];
+                sources.sources[j] = temp;
+            }
+        }
+    }
+    
+    // Calculate checksum
+    sources.checksum = 0;
+    uint8_t* ptr = (uint8_t*)&sources;
+    for (size_t i = 0; i < sizeof(SoundSources) - sizeof(uint32_t); i++) {
+        sources.checksum += ptr[i];
+    }
 }
-
-// Buffer for serial communication
-const size_t BUFFER_SIZE = 4096;  // Buffer size for serial communication
-uint8_t buffer[BUFFER_SIZE];
-
-// Protocol constants
-const uint8_t START_MARKER = 0x1F;
-const uint8_t END_MARKER = 0x1E;
 
 // Write a 32-bit value in big-endian order
 void write_uint32(uint8_t* buffer, uint32_t value) {
@@ -245,17 +294,25 @@ bool send_sound_sources() {
     detect_sound_sources(spectrum_msg, sound_sources_msg);
     
     // Prepare the message buffer
-    const size_t HEADER_SIZE = 1 + 4; // count (1) + checksum (4)
-    const size_t SOURCE_SIZE = 3 * 4;  // x, y, strength (each 4 bytes)
+    const size_t HEADER_SIZE = 1;  // count (1 byte)
+    const size_t SOURCE_SIZE = 12; // x, y, strength (each 4 bytes)
+    const size_t CHECKSUM_SIZE = 4; // checksum (4 bytes)
     const size_t MAX_SOURCES = 10;
-    uint8_t buffer[HEADER_SIZE + MAX_SOURCES * SOURCE_SIZE];
+    
+    // Calculate total message size
+    size_t msg_size = HEADER_SIZE + (sound_sources_msg.count * SOURCE_SIZE) + CHECKSUM_SIZE;
+    
+    // Check if message fits in buffer
+    if (msg_size > BUFFER_SIZE) {
+        return false;
+    }
     
     // Write source count
     buffer[0] = sound_sources_msg.count;
     
     // Write source data
-    for (uint8_t i = 0; i < sound_sources_msg.count; i++) {
-        uint8_t* ptr = buffer + 1 + i * SOURCE_SIZE;
+    for (uint8_t i = 0; i < sound_sources_msg.count && i < MAX_SOURCES; i++) {
+        uint8_t* ptr = buffer + HEADER_SIZE + (i * SOURCE_SIZE);
         
         // Write x coordinate
         uint32_t x_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].x);
@@ -279,46 +336,30 @@ bool send_sound_sources() {
         ptr[11] = strength_int & 0xFF;
     }
     
-    // Calculate and write checksum
+    // Calculate checksum (sum of all bytes except the checksum itself)
     uint32_t checksum = 0;
-    for (size_t i = 0; i < 1 + sound_sources_msg.count * SOURCE_SIZE; i++) {
+    for (size_t i = 0; i < msg_size - CHECKSUM_SIZE; i++) {
         checksum += buffer[i];
-    
-    // Write header
-    write_uint32(buffer + offset, spectrum_msg.x_steps); offset += 4;
-    write_uint32(buffer + offset, spectrum_msg.y_steps); offset += 4;
-    
-    // Write float values
-    write_float(buffer + offset, spectrum_msg.x_min); offset += 4;
-    write_float(buffer + offset, spectrum_msg.x_max); offset += 4;
-    write_float(buffer + offset, spectrum_msg.y_min); offset += 4;
-    write_float(buffer + offset, spectrum_msg.y_max); offset += 4;
-    
-    // Write 2D spectrum data
-    for (int y = 0; y < GRID_Y_STEPS; y++) {
-        for (int x = 0; x < GRID_X_STEPS; x++) {
-            write_float(buffer + offset, spectrum_msg.spectrum_data[y][x]);
-            offset += 4;
-        }
     }
     
-    // Write checksum
-    write_uint32(buffer + offset, spectrum_msg.checksum);
+    // Write checksum at the end
+    uint8_t* checksum_ptr = buffer + msg_size - CHECKSUM_SIZE;
+    checksum_ptr[0] = (checksum >> 24) & 0xFF;
+    checksum_ptr[1] = (checksum >> 16) & 0xFF;
+    checksum_ptr[2] = (checksum >> 8) & 0xFF;
+    checksum_ptr[3] = checksum & 0xFF;
     
     // Send the message
     Serial1.write(START_MARKER);
     
     // Send length (big-endian)
-    uint8_t len_bytes[4] = {
-        (uint8_t)((data_size >> 24) & 0xFF),
-        (uint8_t)((data_size >> 16) & 0xFF),
-        (uint8_t)((data_size >> 8) & 0xFF),
-        (uint8_t)(data_size & 0xFF)
-    };
-    Serial1.write(len_bytes, 4);
+    Serial1.write((msg_size >> 24) & 0xFF);
+    Serial1.write((msg_size >> 16) & 0xFF);
+    Serial1.write((msg_size >> 8) & 0xFF);
+    Serial1.write(msg_size & 0xFF);
     
     // Send data
-    Serial1.write(buffer, data_size);
+    Serial1.write(buffer, msg_size);
     
     // Send end marker
     Serial1.write(END_MARKER);
@@ -347,6 +388,12 @@ void run_music_algorithm() {
   int total_points = GRID_X_STEPS * GRID_Y_STEPS * GRID_Z_STEPS;
   for(int i=0; i<total_points; ++i) {
     music_spectrum[i] = 0.0;
+  }
+  
+  // Initialize spectrum data structure for sound source detection
+  spectrum_msg.spectrum_data.resize(GRID_Y_STEPS);
+  for (int y = 0; y < GRID_Y_STEPS; y++) {
+    spectrum_msg.spectrum_data[y].resize(GRID_X_STEPS);
   }
 
   // 3. Iterate over frequency bins to build the broadband spectrum
@@ -460,14 +507,14 @@ void run_music_algorithm() {
   float est_z = GRID_Z_MIN + (float)max_iz * (GRID_Z_MAX - GRID_Z_MIN) / (GRID_Z_STEPS - 1);
   
   // Output the estimated 3D coordinates
-  if (Serial) {
-    Serial.print("Estimated 3D Coords (mm): X=");
-    Serial.print(est_x, 1);
-    Serial.print(", Y=");
-    Serial.print(est_y, 1);
-    Serial.print(", Z=");
-    Serial.println(est_z, 1);
-  }
+  // if (Serial) {
+  //   Serial.print("Estimated 3D Coords (mm): X=");
+  //   Serial.print(est_x, 1);
+  //   Serial.print(", Y=");
+  //   Serial.print(est_y, 1);
+  //   Serial.print(", Z=");
+  //   Serial.println(est_z, 1);
+  // }
   
   // Also output to Serial1 if connected (e.g., for Raspberry Pi)
   // if (Serial1) {
@@ -479,6 +526,7 @@ void run_music_algorithm() {
   //   Serial1.println(est_z, 1);
   // }
   
-  // Send the complete spectrum data
-  send_spectrum();
+  // Detect and send sound sources
+  detect_sound_sources(spectrum_msg, sound_sources_msg);
+  send_sound_sources();
 }
