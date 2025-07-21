@@ -71,6 +71,8 @@ const int END_FREQ_BIN = 100;      // Freq bin to end analysis
 const float NOISE_FLOOR = 1e-6f;    // Small value to avoid division by zero
 const float MIN_EIGENVALUE = 1e-10f; // Minimum eigenvalue to consider
 
+const int MAX_SOURCES = 5;
+
 // --- Localization Search Grid Configuration ---
 const float GRID_SEARCH = 1000;    // Search radius in mm
 const int STEPS = 20;             // Number of steps per dimension (reduced for 3D search)
@@ -190,7 +192,7 @@ uint32_t calculate_checksum(const uint8_t* data, size_t length) {
 // Simple checksum calculation for sound sources
 
 // Function to detect sound sources from 3D spectrum data
-void detect_sound_sources(const SpectrumData& spectrum, SoundSources& sources) {
+void detect_sound_sources(SoundSources& sources) {
     const float THRESHOLD = 0.5f;  // Minimum intensity threshold (0.0 to 1.0)
     const float MIN_DISTANCE = 0.1f; // Minimum distance between sources (normalized)
     
@@ -291,79 +293,28 @@ void write_float(uint8_t* buffer, float value) {
 
 bool send_sound_sources() {
     // Detect sound sources from the current spectrum
-    detect_sound_sources(spectrum_msg, sound_sources_msg);
+    detect_sound_sources(sound_sources_msg);
     
-    // Prepare the message buffer
-    const size_t HEADER_SIZE = 1;  // count (1 byte)
-    const size_t SOURCE_SIZE = 12; // x, y, strength (each 4 bytes)
-    const size_t CHECKSUM_SIZE = 4; // checksum (4 bytes)
-    const size_t MAX_SOURCES = 10;
+    // Print all sources in one line
+    Serial.print("Sources[");
+    Serial.print(sound_sources_msg.count);
+    Serial.print("]: ");
     
-    // Calculate total message size
-    size_t msg_size = HEADER_SIZE + (sound_sources_msg.count * SOURCE_SIZE) + CHECKSUM_SIZE;
-    
-    // Check if message fits in buffer
-    if (msg_size > BUFFER_SIZE) {
-        return false;
-    }
-    
-    // Write source count
-    buffer[0] = sound_sources_msg.count;
-    
-    // Write source data
     for (uint8_t i = 0; i < sound_sources_msg.count && i < MAX_SOURCES; i++) {
-        uint8_t* ptr = buffer + HEADER_SIZE + (i * SOURCE_SIZE);
-        
-        // Write x coordinate
-        uint32_t x_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].x);
-        ptr[0] = (x_int >> 24) & 0xFF;
-        ptr[1] = (x_int >> 16) & 0xFF;
-        ptr[2] = (x_int >> 8) & 0xFF;
-        ptr[3] = x_int & 0xFF;
-        
-        // Write y coordinate
-        uint32_t y_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].y);
-        ptr[4] = (y_int >> 24) & 0xFF;
-        ptr[5] = (y_int >> 16) & 0xFF;
-        ptr[6] = (y_int >> 8) & 0xFF;
-        ptr[7] = y_int & 0xFF;
-        
-        // Write strength
-        uint32_t strength_int = *reinterpret_cast<uint32_t*>(&sound_sources_msg.sources[i].strength);
-        ptr[8] = (strength_int >> 24) & 0xFF;
-        ptr[9] = (strength_int >> 16) & 0xFF;
-        ptr[10] = (strength_int >> 8) & 0xFF;
-        ptr[11] = strength_int & 0xFF;
+        if (i > 0) Serial.print(" | ");
+        Serial.print(i);
+        Serial.print(":(");
+        Serial.print(sound_sources_msg.sources[i].x, 1);
+        Serial.print(",");
+        Serial.print(sound_sources_msg.sources[i].y, 1);
+        Serial.print(",");
+        Serial.print(sound_sources_msg.sources[i].strength, 2);
+        Serial.print(")");
     }
+    Serial.println();
     
-    // Calculate checksum (sum of all bytes except the checksum itself)
-    uint32_t checksum = 0;
-    for (size_t i = 0; i < msg_size - CHECKSUM_SIZE; i++) {
-        checksum += buffer[i];
-    }
-    
-    // Write checksum at the end
-    uint8_t* checksum_ptr = buffer + msg_size - CHECKSUM_SIZE;
-    checksum_ptr[0] = (checksum >> 24) & 0xFF;
-    checksum_ptr[1] = (checksum >> 16) & 0xFF;
-    checksum_ptr[2] = (checksum >> 8) & 0xFF;
-    checksum_ptr[3] = checksum & 0xFF;
-    
-    // Send the message
-    Serial1.write(START_MARKER);
-    
-    // Send length (big-endian)
-    Serial1.write((msg_size >> 24) & 0xFF);
-    Serial1.write((msg_size >> 16) & 0xFF);
-    Serial1.write((msg_size >> 8) & 0xFF);
-    Serial1.write(msg_size & 0xFF);
-    
-    // Send data
-    Serial1.write(buffer, msg_size);
-    
-    // Send end marker
-    Serial1.write(END_MARKER);
-    Serial1.flush();
+    // Add a small delay to make the output readable
+    delay(100);
     
     return true;
 }
@@ -527,6 +478,5 @@ void run_music_algorithm() {
   // }
   
   // Detect and send sound sources
-  detect_sound_sources(spectrum_msg, sound_sources_msg);
   send_sound_sources();
 }

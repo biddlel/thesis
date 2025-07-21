@@ -197,99 +197,112 @@ def read_binary_message(ser, timeout=5.0):
 
 def read_sound_sources(ser):
     """Read and parse sound sources data from the serial port"""
-    data = read_binary_message(ser)
-    if not data:
-        return None
-    
     try:
-        offset = 0
-        
-        # Read source count
-        if len(data) < 1:
-            raise ValueError("No data received")
-        source_count = data[0]
-        offset += 1
-        
-        # Calculate expected data size
-        SOURCE_SIZE = 12  # 3 floats (x, y, strength) * 4 bytes each
-        expected_size = 1 + (source_count * SOURCE_SIZE) + 4  # count + sources + checksum
-        
-        if len(data) != expected_size:
-            raise ValueError(f"Invalid data length: expected {expected_size} bytes, got {len(data)}")
-        
-        # Read sources
-        sources = []
-        for _ in range(source_count):
-            if offset + SOURCE_SIZE > len(data):
-                raise ValueError("Unexpected end of data while reading sources")
-            
-            # Read x, y, strength as floats
-            x = struct.unpack('>f', data[offset:offset+4])[0]; offset += 4
-            y = struct.unpack('>f', data[offset:offset+4])[0]; offset += 4
-            strength = struct.unpack('>f', data[offset:offset+4])[0]; offset += 4
-            
-            sources.append({
-                'x': x,
-                'y': y,
-                'strength': strength
-            })
-        
-        # Read checksum
-        received_checksum = struct.unpack('>I', data[offset:offset+4])[0]
-        
-        # Create message dictionary
-        message = {
-            'sources': sources,
-            'count': source_count,
-            'checksum': received_checksum,
-            'timestamp': datetime.now()
-        }
-        
-        # Calculate checksum (sum of all bytes except the last 4)
-        calculated_checksum = sum(data[:-4])
-        
-        # Verify checksum
-        if received_checksum != calculated_checksum:
-            log_message(f"Checksum mismatch: received 0x{received_checksum:08X}, calculated 0x{calculated_checksum:08X}")
+        # Read a line from serial
+        line = ser.readline().decode('ascii', errors='ignore').strip()
+        if not line:
             return None
-        
-        log_message(f"Successfully read {source_count} sound sources")
-        return message
-        
+            
+        # Skip non-source lines
+        if not line.startswith('Sources['):
+            log_message(f"Skipping line: {line}")
+            return None
+            
+        # Parse the source count
+        try:
+            # Extract the count from 'Sources[2]: 0:(...' -> '2'
+            count_str = line.split('[')[1].split(']')[0]
+            source_count = int(count_str)
+            
+            # Extract the sources part after ']: '
+            sources_part = line.split(']: ', 1)[1]
+            
+            # Parse each source
+            sources = []
+            for source_str in sources_part.split(' | '):
+                # Format: '0:(x,y,str)'
+                if not source_str or ':' not in source_str or '(' not in source_str:
+                    continue
+                    
+                # Extract coordinates and strength
+                coords_str = source_str.split('(', 1)[1].rstrip(')')
+                x_str, y_str, strength_str = coords_str.split(',')
+                
+                sources.append({
+                    'x': float(x_str),
+                    'y': float(y_str),
+                    'strength': float(strength_str)
+                })
+            
+            # Create message dictionary
+            message = {
+                'sources': sources,
+                'count': source_count,
+                'timestamp': datetime.now()
+            }
+            
+            # Verify we got the expected number of sources
+            if len(sources) != source_count:
+                log_message(f"Warning: Expected {source_count} sources, got {len(sources)}")
+            
+            log_message(f"Parsed {len(sources)} sound sources")
+            return message
+            
+        except (ValueError, IndexError) as e:
+            log_message(f"Error parsing line '{line}': {e}")
+            return None
+            
     except Exception as e:
-        log_message(f"Error parsing sound sources: {e}")
+        log_message(f"Error reading from serial: {e}")
         import traceback
         log_message(traceback.format_exc())
         return None
 
-def plot_spectrum(spectrum_data, output_dir, plot_number):
-    """Create and save a visualization of the spectrum"""
+def plot_spectrum(sources_data, output_dir, plot_number):
+    """Create and save a visualization of the sound sources"""
     try:
-        # Convert the 2D array to numpy array
-        spectrum_2d = np.array(spectrum_data['spectrum_data'])
-        
         # Create figure
         plt.figure(figsize=(10, 8))
         
-        # Plot the 2D spectrum
-        plt.imshow(spectrum_2d.T,
-                  extent=[spectrum_data['x_min'], spectrum_data['x_max'],
-                          spectrum_data['y_min'], spectrum_data['y_max']],
-                  origin='lower', aspect='auto', cmap='viridis')
+        # Create a scatter plot of the sources
+        if sources_data['count'] > 0:
+            x = [s['x'] for s in sources_data['sources']]
+            y = [s['y'] for s in sources_data['sources']]
+            strengths = [s['strength'] for s in sources_data['sources']]
+            
+            # Scale marker size by strength (with some reasonable limits)
+            sizes = [100 + s * 500 for s in strengths]  # Scale factor can be adjusted
+            
+            # Create scatter plot
+            scatter = plt.scatter(x, y, s=sizes, c=strengths, 
+                                cmap='viridis', alpha=0.7,
+                                vmin=0, vmax=1)  # Normalize strength to 0-1
+            
+            # Add colorbar
+            plt.colorbar(scatter, label='Source Strength')
+            
+            # Add source numbers
+            for i, (xi, yi) in enumerate(zip(x, y)):
+                plt.text(xi, yi, str(i), ha='center', va='center', 
+                        color='white' if strengths[i] > 0.5 else 'black')
         
-        plt.colorbar(label='Average Power (dB)')
+        # Set plot limits (adjust these based on your setup)
+        plt.xlim(-1000, 1000)  # mm
+        plt.ylim(-1000, 1000)  # mm
+        
         plt.xlabel('X Position (mm)')
         plt.ylabel('Y Position (mm)')
-        plt.title('Sound Source Localization (Z-Averaged)')
+        plt.title('Sound Source Localization')
+        plt.grid(True, alpha=0.3)
         
         # Add timestamp
-        timestamp = spectrum_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-        plt.figtext(0.5, 0.01, f'Last Update: {timestamp}', 
+        timestamp = sources_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+        plt.figtext(0.5, 0.01, f'Last Update: {timestamp} | {sources_data["count"]} sources', 
                    ha='center', fontsize=8, style='italic')
         
         # Save figure
         os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f'spectrum_{plot_number:04d}.png')
+        output_path = os.path.join(output_dir, f'sources_{plot_number:04d}.png')
         plt.savefig(output_path, bbox_inches='tight', dpi=100)
         plt.close()
         
@@ -303,6 +316,8 @@ def plot_spectrum(spectrum_data, output_dir, plot_number):
         
     except Exception as e:
         log_message(f"Error creating plot: {e}")
+        import traceback
+        log_message(traceback.format_exc())
         return None
 
 def cleanup_old_plots(output_dir, max_plots):
@@ -338,6 +353,14 @@ def main():
         log_message("Error: Could not find Teensy. Please check the connection.")
         return
     
+    try:
+        # Open serial connection
+        ser = serial.Serial(port, baudrate=115200, timeout=1.0)
+        log_message(f"Connected to {port} at 115200 baud")
+    except serial.SerialException as e:
+        log_message(f"Error opening serial port {port}: {e}")
+        return
+
     # Main loop
     plot_number = 0
     last_plot_time = time.time()
@@ -349,38 +372,28 @@ def main():
             
             if sources_data and sources_data['count'] > 0:
                 # Filter sources by minimum strength
-                filtered_sources = [s for s in sources_data['sources'] if s['strength'] >= args.min_strength]
+                filtered_sources = [s for s in sources_data['sources'] if s['strength'] >= 0.0]
                 sources_data['sources'] = filtered_sources
                 sources_data['count'] = len(filtered_sources)
                 
                 # Plot at specified interval if we have any sources
                 current_time = time.time()
-                if current_time - last_plot_time >= args.plot_interval and sources_data['count'] > 0:
-                    plot_sound_sources(sources_data, args.output, plot_number)
+                if current_time - last_plot_time >= 1.0 and sources_data['count'] > 0:
+                    plot_spectrum(sources_data, OUTPUT_DIR, plot_number)
                     plot_number += 1
                     last_plot_time = current_time
-                # Clean up old plots periodically
-                if plot_number % 10 == 0:
+                    
+                    # Clean up old plots
                     cleanup_old_plots(OUTPUT_DIR, MAX_PLOTS)
-                
-                plot_number += 1
-                last_plot_time = current_time
-            
-            # Periodic status update
-            if current_time - last_log_time > 60:  # Every minute
-                log_message(f"Still running... {plot_number} plots saved")
-                last_log_time = current_time
-                
-    except serial.SerialException as e:
-        log_message(f"Serial port error: {e}")
+    
     except KeyboardInterrupt:
-        log_message("Stopped by user")
+        log_message("Spectrum visualizer stopped by user")
     except Exception as e:
         log_message(f"Unexpected error: {e}")
     finally:
         if 'ser' in locals() and ser.is_open:
             ser.close()
-            log_message("Serial port closed")
+            log_message("Closed serial connection")
         log_message("Spectrum visualizer stopped")
 
 if __name__ == "__main__":
