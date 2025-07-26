@@ -89,10 +89,10 @@ void loop() {
         queue4.available() >= 1) {
         
         // Get audio blocks from each queue
-        int16_t *block1 = queue1.readBuffer()->data;
-        int16_t *block2 = queue2.readBuffer()->data;
-        int16_t *block3 = queue3.readBuffer()->data;
-        int16_t *block4 = queue4.readBuffer()->data;
+        int16_t *block1 = queue1.readBuffer();
+        int16_t *block2 = queue2.readBuffer();
+        int16_t *block3 = queue3.readBuffer();
+        int16_t *block4 = queue4.readBuffer();
         
         // Copy samples to our buffer
         for (int i = 0; i < SAMPLES_PER_BLOCK; i++) {
