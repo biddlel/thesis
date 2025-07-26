@@ -13,8 +13,8 @@ AudioRecordQueue         queue4;
 // Using separate I2S interfaces for better channel separation
 AudioConnection          patchCord1(i2s1, 0, queue1, 0);  // Mic 1 (left channel of i2s1)
 AudioConnection          patchCord2(i2s1, 1, queue2, 0);  // Mic 2 (right channel of i2s1)
-AudioConnection          patchCord3(i2s2, 0, queue3, 0);  // Mic 3 (left channel of i2s2)
-AudioConnection          patchCord4(i2s2, 1, queue4, 0);  // Mic 4 (right channel of i2s2)
+AudioConnection          patchCord3(i2s1, 2, queue3, 0);  // Mic 3 (left channel of i2s2)
+AudioConnection          patchCord4(i2s1, 3, queue4, 0);  // Mic 4 (right channel of i2s2)
 
 // Microphone array configuration
 const int NUM_MICS = 4;                     // Number of microphones
