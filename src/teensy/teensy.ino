@@ -144,7 +144,7 @@ void print_mic_positions() {
     Serial.println();
 }
 
-// Send audio buffer over serial
+// Send audio buffer over serial as text
 void send_audio_buffer() {
     // Calculate mean for each microphone
     for (int mic = 0; mic < NUM_MICS; mic++) {
@@ -155,28 +155,15 @@ void send_audio_buffer() {
         mean_buffer[mic] = (float)sum / BUFFER_SIZE;
     }
     
-    // Send start marker
-    Serial1.write(START_MARKER);
+    // Print timestamp first
+    Serial1.print(millis());
     
-    // Send timestamp (4 bytes)
-    uint32_t timestamp = millis();
-    Serial1.write((uint8_t*)(&timestamp), 4);
-    
-    // Send mean values (4 bytes per float)
+    // Print mean values with 6 decimal places
     for (int i = 0; i < NUM_MICS; i++) {
-        Serial1.write((uint8_t*)(&mean_buffer[i]), 4);
+        Serial1.print(',');
+        Serial1.print(mean_buffer[i], 6);
     }
-    
-    // Calculate and send checksum (XOR of all bytes)
-    uint8_t checksum = 0;
-    uint8_t* data = (uint8_t*)mean_buffer;
-    for (size_t i = 0; i < sizeof(mean_buffer); i++) {
-        checksum ^= data[i];
-    }
-    Serial1.write(checksum);
-    
-    // Send end marker
-    Serial1.write(END_MARKER);
+    Serial1.println();  // End of line
     
     // Debug output
     static unsigned long last_print = 0;

@@ -70,15 +70,13 @@ class TeensyAudioReceiver:
     """Handles receiving and processing mean values from the Teensy."""
     
     def __init__(self, port: str = SERIAL_PORT, baud_rate: int = BAUD_RATE):
-        """Initialize the serial connection and buffers."""
+        """Initialize the serial connection."""
         self.port = port
         self.baud_rate = baud_rate
         self.serial_conn = None
-        self.buffer = bytearray()
         self.packet_count = 0
         self.bytes_received = 0
         self.last_print_time = time.time()
-        self.last_timestamp = 0
         
     def connect(self) -> bool:
         """Connect to the Teensy via serial."""
@@ -98,61 +96,26 @@ class TeensyAudioReceiver:
             return False
     
     def read_packet(self) -> Optional[AudioPacket]:
-        """Read and parse a single packet of mean values from the Teensy."""
-        # Read any available data
+        """Read and parse a single line of mean values from the Teensy."""
         if self.serial_conn.in_waiting > 0:
-            self.buffer.extend(self.serial_conn.read(self.serial_conn.in_waiting))
-        
-        # Look for start marker
-        while len(self.buffer) >= 1:
-            if self.buffer[0] != START_MARKER:
-                # Discard bytes until we find a start marker
-                self.buffer.pop(0)
-                continue
-                
-            # Check if we have a complete packet
-            if len(self.buffer) < CHUNK_SIZE:
-                return None  # Incomplete packet
-                
-            # Extract the packet
-            packet = self.buffer[:CHUNK_SIZE]
-            self.buffer = self.buffer[CHUNK_SIZE:]
-            
-            # Verify end marker
-            if packet[-1] != END_MARKER:
-                print(f"Error: Invalid end marker (got 0x{packet[-1]:02X}, expected 0x{END_MARKER:02X})")
-                print("Packet dump (hex):")
-                for i in range(0, len(packet), 16):
-                    chunk = packet[i:i+16]
-                    print(f"{i:04X}: ", end='')
-                    for b in chunk:
-                        print(f"{b:02X} ", end='')
-                    print(" " * (3 * (16 - len(chunk)) + 2), end='')
-                    for b in chunk:
-                        c = chr(b) if 32 <= b <= 126 else '.'
-                        print(c, end='')
-                    print()
+            # Read a line from serial
+            line = self.serial_conn.readline().decode('ascii', errors='ignore').strip()
+            if not line:
                 return None
                 
             try:
-                # Extract timestamp (big-endian uint32)
-                timestamp = int.from_bytes(packet[1:5], byteorder='big')
-                
-                # Extract mean values (4 floats, 4 bytes each)
-                means = np.frombuffer(packet[5:5+MEAN_VALUES_SIZE], dtype='<f4')
-                
-                # Verify checksum
-                checksum = packet[-2]  # Second to last byte
-                calculated_checksum = 0
-                for b in packet[5:-2]:  # All bytes except start marker, end marker, and checksum
-                    calculated_checksum ^= b
-                
-                if checksum != calculated_checksum:
-                    print(f"Checksum error: expected 0x{checksum:02X}, got 0x{calculated_checksum:02X}")
+                # Split the line into values
+                values = line.split(',')
+                if len(values) != NUM_MICS + 1:  # timestamp + NUM_MICS values
+                    print(f"Unexpected number of values: {len(values)} (expected {NUM_MICS + 1})")
                     return None
+                    
+                timestamp = int(values[0])
+                means = np.array([float(v) for v in values[1:]], dtype=np.float32)
                 
+                # Update statistics
                 self.packet_count += 1
-                self.bytes_received += CHUNK_SIZE
+                self.bytes_received += len(line)
                 
                 # Print status periodically
                 current_time = time.time()
@@ -160,15 +123,13 @@ class TeensyAudioReceiver:
                     rate = self.bytes_received / (current_time - self.last_print_time) / 1024
                     print(f"Received {self.packet_count} packets ({rate:.1f} KB/s)")
                     self.last_print_time = current_time
-                
+                    self.bytes_received = 0
+                    
                 return AudioPacket(timestamp, means)
                 
             except Exception as e:
-                print(f"Error parsing packet: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"Error parsing line '{line}': {e}")
                 return None
-        
         return None
     
     def process_in_background(self, callback):
