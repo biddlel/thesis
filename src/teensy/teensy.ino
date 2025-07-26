@@ -3,8 +3,7 @@
 #include <SPI.h>
 
 // Audio setup
-AudioInputI2S            i2s1;  // I2S input for mics 1 & 2
-AudioInputI2S            i2s2;  // I2S input for mics 3 & 4
+AudioInputI2SQuad        i2s1;
 AudioRecordQueue         queue1;
 AudioRecordQueue         queue2;
 AudioRecordQueue         queue3;

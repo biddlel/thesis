@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-Audio Processor for Sound Source Localization
+Audio Processor for Sound Source Localization with Quad I2S Support
 
 This script:
-1. Reads raw audio data from a Teensy via serial
-2. Parses the binary data format
-3. Buffers the audio data
-4. Prepares it for processing with the Acoular library
+1. Receives raw audio data from a Teensy 4.x via serial using I2S Quad mode
+2. Parses the binary data format with error checking
+3. Buffers the audio data for processing
+4. Performs beamforming using the Acoular library
+5. Visualizes sound source locations
+
+Data Format (from Teensy):
+- Header: 0x1F (1 byte) + timestamp (4 bytes, big-endian)
+- Audio Data: 4 channels interleaved, 16-bit PCM, little-endian
+- Footer: checksum (1 byte, XOR of all audio bytes) + 0x1E (1 byte)
 """
+
+import os
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
 import serial
 import numpy as np
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import struct
 import threading
 from queue import Queue
@@ -40,6 +49,14 @@ FOOTER_SIZE = 2  # 1 byte checksum + 1 byte end marker
 SAMPLE_BYTES = 2  # 16-bit samples
 CHUNK_SIZE = NUM_MICS * BUFFER_SIZE * SAMPLE_BYTES + HEADER_SIZE + FOOTER_SIZE
 
+# Microphone positions in meters (matching Teensy order)
+MIC_POSITIONS = {
+    0: {'name': 'Top-Right',    'pos': [ 0.09641,  0.09005, 0.0]},
+    1: {'name': 'Top-Left',     'pos': [-0.09808, 0.08986, 0.0]},
+    2: {'name': 'Bottom-Left',  'pos': [-0.09913, -0.09622, 0.0]},
+    3: {'name': 'Bottom-Right', 'pos': [0.09684, -0.09678, 0.0]}
+}
+
 @dataclass
 class AudioPacket:
     """Container for a single packet of audio data from the Teensy."""
@@ -51,7 +68,7 @@ class AudioPacket:
             f"Expected shape {(NUM_MICS, BUFFER_SIZE)}, got {self.data.shape}"
 
 class TeensyAudioReceiver:
-    """Handles receiving and processing audio data from the Teensy."""
+    """Handles receiving and processing audio data from the Teensy in quad I2S mode."""
     
     def __init__(self, port: str = SERIAL_PORT, baud_rate: int = BAUD_RATE):
         """Initialize the serial connection and buffers."""
@@ -62,6 +79,7 @@ class TeensyAudioReceiver:
         self.packet_count = 0
         self.bytes_received = 0
         self.last_print_time = time.time()
+        self.last_timestamp = 0
         
         # Circular buffer for storing audio data (keeps last N packets)
         self.audio_buffer = deque(maxlen=10)  # Adjust maxlen as needed
@@ -75,6 +93,9 @@ class TeensyAudioReceiver:
                 timeout=1.0
             )
             print(f"Connected to {self.port} at {self.baud_rate} baud")
+            print("Microphone order in stream:")
+            for i in range(NUM_MICS):
+                print(f"  {i}: {MIC_POSITIONS[i]['name']} at {MIC_POSITIONS[i]['pos']}")
             return True
         except serial.SerialException as e:
             print(f"Error opening serial port {self.port}: {e}")
@@ -114,7 +135,7 @@ class TeensyAudioReceiver:
             
             # Verify end marker
             if packet[-1] != END_MARKER:
-                print("Error: Invalid end marker")
+                print(f"Error: Invalid end marker (got 0x{packet[-1]:02X}, expected 0x{END_MARKER:02X})")
                 return None
                 
             # Parse the packet
@@ -122,11 +143,16 @@ class TeensyAudioReceiver:
                 # Extract timestamp (big-endian uint32)
                 timestamp = int.from_bytes(packet[1:5], byteorder='big')
                 
+                # Check for timestamp issues (optional)
+                if self.last_timestamp > 0 and timestamp < self.last_timestamp:
+                    print(f"Warning: Non-monotonic timestamp: {timestamp} < {self.last_timestamp}")
+                self.last_timestamp = timestamp
+                
                 # Extract audio data (4 channels interleaved)
                 audio_data = np.frombuffer(
                     packet[HEADER_SIZE:-FOOTER_SIZE], 
-                    dtype=np.int16
-                ).reshape(NUM_MICS, BUFFER_SIZE)
+                    dtype='<i2'  # Little-endian 16-bit integers
+                ).reshape(NUM_MICS, BUFFER_SIZE, order='F')  # Fortran order for column-major
                 
                 # Verify checksum
                 checksum = packet[-2]  # Second to last byte
@@ -136,7 +162,7 @@ class TeensyAudioReceiver:
                     calculated_checksum ^= ((sample >> 8) & 0xFF)
                 
                 if checksum != calculated_checksum:
-                    print(f"Checksum error: expected {checksum:02X}, got {calculated_checksum:02X}")
+                    print(f"Checksum error: expected 0x{checksum:02X}, got 0x{calculated_checksum:02X}")
                     return None
                 
                 self.packet_count += 1
@@ -145,13 +171,18 @@ class TeensyAudioReceiver:
                 # Print status periodically
                 current_time = time.time()
                 if current_time - self.last_print_time > 1.0:
-                    print(f"Received {self.packet_count} packets ({self.bytes_received/1024:.1f} KB)")
+                    print(f"Received {self.packet_count} packets "
+                          f"({self.bytes_received/1024:.1f} KB, "
+                          f"{self.bytes_received/(current_time - self.last_print_time)/1024:.1f} KB/s)")
                     self.last_print_time = current_time
                 
-                return AudioPacket(timestamp, audio_data.astype(np.float32) / 32768.0)  # Convert to float32 [-1, 1]
+                # Convert to float32 in range [-1, 1] and return
+                return AudioPacket(timestamp, audio_data.astype(np.float32) / 32768.0)
                 
             except Exception as e:
                 print(f"Error parsing packet: {e}")
+                import traceback
+                traceback.print_exc()
                 return None
         
         return None
@@ -168,16 +199,15 @@ class TeensyAudioReceiver:
                 return
         
         print(f"Starting audio processing at {SAMPLE_RATE} Hz")
+        print("Press Ctrl+C to stop...")
         
         try:
             while True:
                 packet = self.read_packet()
                 if packet:
-                    self.audio_buffer.append(packet)
-                    if callback:
-                        callback(packet)
-                time.sleep(0.001)  # Small sleep to prevent 100% CPU usage
-                
+                    callback(packet)
+                time.sleep(0.001)  # Small sleep to prevent 100% CPU
+                    
         except KeyboardInterrupt:
             print("\nStopping audio processing")
         except Exception as e:
@@ -185,12 +215,12 @@ class TeensyAudioReceiver:
         finally:
             self.disconnect()
 
-def setup_acoular_processing():
+def setup_acoular_processing() -> Optional[Dict[str, Any]]:
     """
-    Set up the Acoular processing pipeline.
+    Set up the Acoular processing pipeline for quad I2S input.
     
     Returns:
-        A configured Acoular processing pipeline.
+        A dictionary containing the Acoular processing context, or None on error.
     """
     try:
         import acoular
@@ -200,22 +230,25 @@ def setup_acoular_processing():
         
         print("Acoular version:", acoular.__version__)
         
-        # Microphone geometry (update with your actual mic positions in meters)
-        # Positions should match the order in the Teensy code (Top-Right, Top-Left, Bottom-Left, Bottom-Right)
+        # Microphone geometry from MIC_POSITIONS
         mg = MicGeom()
-        mg.mpos_tot = np.array([
-            [0.09641,  0.09005, 0.0],  # Top-Right
-            [-0.09808, 0.08986, 0.0],  # Top-Left
-            [-0.09913, -0.09622, 0.0], # Bottom-Left
-            [0.09684, -0.09678, 0.0]   # Bottom-Right
-        ]).T  # Transpose to match Acoular's expected shape (3, n_mics)
+        mic_positions = np.array([MIC_POSITIONS[i]['pos'] for i in range(NUM_MICS)]).T
+        
+        # Use the new pos_total attribute instead of mpos_tot
+        if hasattr(mg, 'pos_total'):
+            mg.pos_total = mic_positions
+        else:
+            # Fallback for older versions
+            mg.mpos_tot = mic_positions  # type: ignore
         
         # Basic processing pipeline
-        env = Environment(c=343.0)  # Speed of sound in m/s
+        env = Environment(c=343.0)  # Speed of sound in m/s at 20°C
         grid = RectGrid(x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, z=1.0, increment=0.05)
         st = SteeringVector(grid=grid, mics=mg, env=env)
         
         print("Acoular processing pipeline initialized")
+        print(f"Using {NUM_MICS} microphones with sample rate {SAMPLE_RATE} Hz")
+        
         return {
             'mic_geometry': mg,
             'environment': env,
@@ -228,7 +261,6 @@ def setup_acoular_processing():
         print("pip install acoular")
         print(f"Import error: {e}")
         return None
-
 
 def main():
     """Main function to demonstrate the audio processing pipeline."""
