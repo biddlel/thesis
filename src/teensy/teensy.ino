@@ -40,6 +40,9 @@ const int BUFFER_SIZE = 1024;  // Number of samples per channel per transmission
 int16_t audio_buffer[NUM_MICS][BUFFER_SIZE];
 volatile int sample_count = 0;
 
+// Audio buffer for mean values
+float mean_buffer[NUM_MICS];
+
 // Serial communication
 const byte START_MARKER = 0x1F;
 const byte END_MARKER = 0x1E;
@@ -143,28 +146,32 @@ void print_mic_positions() {
 
 // Send audio buffer over serial
 void send_audio_buffer() {
+    // Calculate mean for each microphone
+    for (int mic = 0; mic < NUM_MICS; mic++) {
+        int32_t sum = 0;
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+            sum += audio_buffer[mic][i];
+        }
+        mean_buffer[mic] = (float)sum / BUFFER_SIZE;
+    }
+    
     // Send start marker
     Serial1.write(START_MARKER);
     
-    // Send timestamp (milliseconds since startup)
+    // Send timestamp (4 bytes)
     uint32_t timestamp = millis();
-    Serial1.write((uint8_t*)&timestamp, 4);
+    Serial1.write((uint8_t*)(&timestamp), 4);
     
-    // Send audio data for all channels
-    for (int ch = 0; ch < NUM_MICS; ch++) {
-        for (int i = 0; i < BUFFER_SIZE; i++) {
-            int16_t sample = audio_buffer[ch][i];
-            Serial1.write((uint8_t*)&sample, 2);
-        }
+    // Send mean values (4 bytes per float)
+    for (int i = 0; i < NUM_MICS; i++) {
+        Serial1.write((uint8_t*)(&mean_buffer[i]), 4);
     }
     
-    // Calculate and send checksum (simple XOR)
+    // Calculate and send checksum (XOR of all bytes)
     uint8_t checksum = 0;
-    for (int ch = 0; ch < NUM_MICS; ch++) {
-        for (int i = 0; i < BUFFER_SIZE; i++) {
-            checksum ^= (audio_buffer[ch][i] & 0xFF);
-            checksum ^= ((audio_buffer[ch][i] >> 8) & 0xFF);
-        }
+    uint8_t* data = (uint8_t*)mean_buffer;
+    for (size_t i = 0; i < sizeof(mean_buffer); i++) {
+        checksum ^= data[i];
     }
     Serial1.write(checksum);
     
@@ -174,9 +181,7 @@ void send_audio_buffer() {
     // Debug output
     static unsigned long last_print = 0;
     if (millis() - last_print > 1000) {
-        Serial.print("Sent ");
-        Serial.print(BUFFER_SIZE);
-        Serial.println(" samples per channel");
+        Serial.print("Sent mean values\n");
         last_print = millis();
     }
 }

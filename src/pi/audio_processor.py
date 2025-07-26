@@ -11,7 +11,7 @@ This script:
 
 Data Format (from Teensy):
 - Header: 0x1F (1 byte) + timestamp (4 bytes, big-endian)
-- Audio Data: 4 channels interleaved, 16-bit PCM, little-endian
+- Mean Values: 4 floats, 4 bytes each
 - Footer: checksum (1 byte, XOR of all audio bytes) + 0x1E (1 byte)
 """
 
@@ -38,16 +38,15 @@ from scipy.signal import butter, lfilter
 SERIAL_PORT = '/dev/ttyAMA0'  # Update this to match your serial port
 BAUD_RATE = 115200
 NUM_MICS = 4
-BUFFER_SIZE = 1024  # Must match the Teensy BUFFER_SIZE
-SAMPLE_RATE = 44100  # Must match the Teensy SAMPLE_RATE
+SAMPLE_RATE = 44100  # Still needed for timing
 
 # Protocol constants
 START_MARKER = 0x1F
 END_MARKER = 0x1E
 HEADER_SIZE = 5  # 1 byte start marker + 4 bytes timestamp
 FOOTER_SIZE = 2  # 1 byte checksum + 1 byte end marker
-SAMPLE_BYTES = 2  # 16-bit samples
-CHUNK_SIZE = NUM_MICS * BUFFER_SIZE * SAMPLE_BYTES + HEADER_SIZE + FOOTER_SIZE
+MEAN_VALUES_SIZE = NUM_MICS * 4  # 4 bytes per float
+CHUNK_SIZE = HEADER_SIZE + MEAN_VALUES_SIZE + FOOTER_SIZE
 
 # Microphone positions in meters (matching Teensy order)
 MIC_POSITIONS = {
@@ -59,16 +58,16 @@ MIC_POSITIONS = {
 
 @dataclass
 class AudioPacket:
-    """Container for a single packet of audio data from the Teensy."""
+    """Container for mean values from the Teensy."""
     timestamp: int  # milliseconds since Teensy startup
-    data: np.ndarray  # Shape: (NUM_MICS, BUFFER_SIZE)
+    means: np.ndarray  # Shape: (NUM_MICS,)
     
     def __post_init__(self):
-        assert self.data.shape == (NUM_MICS, BUFFER_SIZE), \
-            f"Expected shape {(NUM_MICS, BUFFER_SIZE)}, got {self.data.shape}"
+        assert self.means.shape == (NUM_MICS,), \
+            f"Expected shape {(NUM_MICS,)}, got {self.means.shape}"
 
 class TeensyAudioReceiver:
-    """Handles receiving and processing audio data from the Teensy in quad I2S mode."""
+    """Handles receiving and processing mean values from the Teensy."""
     
     def __init__(self, port: str = SERIAL_PORT, baud_rate: int = BAUD_RATE):
         """Initialize the serial connection and buffers."""
@@ -80,9 +79,6 @@ class TeensyAudioReceiver:
         self.bytes_received = 0
         self.last_print_time = time.time()
         self.last_timestamp = 0
-        
-        # Circular buffer for storing audio data (keeps last N packets)
-        self.audio_buffer = deque(maxlen=10)  # Adjust maxlen as needed
         
     def connect(self) -> bool:
         """Connect to the Teensy via serial."""
@@ -101,19 +97,8 @@ class TeensyAudioReceiver:
             print(f"Error opening serial port {self.port}: {e}")
             return False
     
-    def disconnect(self):
-        """Close the serial connection."""
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-            print("Disconnected from serial port")
-    
     def read_packet(self) -> Optional[AudioPacket]:
-        """
-        Read and parse a single audio packet from the serial connection.
-        
-        Returns:
-            AudioPacket if a complete packet was received, None otherwise.
-        """
+        """Read and parse a single packet of mean values from the Teensy."""
         # Read any available data
         if self.serial_conn.in_waiting > 0:
             self.buffer.extend(self.serial_conn.read(self.serial_conn.in_waiting))
@@ -136,30 +121,31 @@ class TeensyAudioReceiver:
             # Verify end marker
             if packet[-1] != END_MARKER:
                 print(f"Error: Invalid end marker (got 0x{packet[-1]:02X}, expected 0x{END_MARKER:02X})")
+                print("Packet dump (hex):")
+                for i in range(0, len(packet), 16):
+                    chunk = packet[i:i+16]
+                    print(f"{i:04X}: ", end='')
+                    for b in chunk:
+                        print(f"{b:02X} ", end='')
+                    print(" " * (3 * (16 - len(chunk)) + 2), end='')
+                    for b in chunk:
+                        c = chr(b) if 32 <= b <= 126 else '.'
+                        print(c, end='')
+                    print()
                 return None
                 
-            # Parse the packet
             try:
                 # Extract timestamp (big-endian uint32)
                 timestamp = int.from_bytes(packet[1:5], byteorder='big')
                 
-                # Check for timestamp issues (optional)
-                if self.last_timestamp > 0 and timestamp < self.last_timestamp:
-                    print(f"Warning: Non-monotonic timestamp: {timestamp} < {self.last_timestamp}")
-                self.last_timestamp = timestamp
-                
-                # Extract audio data (4 channels interleaved)
-                audio_data = np.frombuffer(
-                    packet[HEADER_SIZE:-FOOTER_SIZE], 
-                    dtype='<i2'  # Little-endian 16-bit integers
-                ).reshape(NUM_MICS, BUFFER_SIZE, order='F')  # Fortran order for column-major
+                # Extract mean values (4 floats, 4 bytes each)
+                means = np.frombuffer(packet[5:5+MEAN_VALUES_SIZE], dtype='<f4')
                 
                 # Verify checksum
                 checksum = packet[-2]  # Second to last byte
                 calculated_checksum = 0
-                for sample in audio_data.flat:
-                    calculated_checksum ^= (sample & 0xFF)
-                    calculated_checksum ^= ((sample >> 8) & 0xFF)
+                for b in packet[5:-2]:  # All bytes except start marker, end marker, and checksum
+                    calculated_checksum ^= b
                 
                 if checksum != calculated_checksum:
                     print(f"Checksum error: expected 0x{checksum:02X}, got 0x{calculated_checksum:02X}")
@@ -171,13 +157,11 @@ class TeensyAudioReceiver:
                 # Print status periodically
                 current_time = time.time()
                 if current_time - self.last_print_time > 1.0:
-                    print(f"Received {self.packet_count} packets "
-                          f"({self.bytes_received/1024:.1f} KB, "
-                          f"{self.bytes_received/(current_time - self.last_print_time)/1024:.1f} KB/s)")
+                    rate = self.bytes_received / (current_time - self.last_print_time) / 1024
+                    print(f"Received {self.packet_count} packets ({rate:.1f} KB/s)")
                     self.last_print_time = current_time
                 
-                # Convert to float32 in range [-1, 1] and return
-                return AudioPacket(timestamp, audio_data.astype(np.float32) / 32768.0)
+                return AudioPacket(timestamp, means)
                 
             except Exception as e:
                 print(f"Error parsing packet: {e}")
@@ -189,7 +173,7 @@ class TeensyAudioReceiver:
     
     def process_in_background(self, callback):
         """
-        Continuously read and process audio data in a background thread.
+        Continuously read and process mean values in a background thread.
         
         Args:
             callback: Function to call with each received AudioPacket
@@ -198,7 +182,7 @@ class TeensyAudioReceiver:
             if not self.connect():
                 return
         
-        print(f"Starting audio processing at {SAMPLE_RATE} Hz")
+        print(f"Starting mean value processing")
         print("Press Ctrl+C to stop...")
         
         try:
@@ -209,7 +193,7 @@ class TeensyAudioReceiver:
                 time.sleep(0.001)  # Small sleep to prevent 100% CPU
                     
         except KeyboardInterrupt:
-            print("\nStopping audio processing")
+            print("\nStopping mean value processing")
         except Exception as e:
             print(f"Error in processing loop: {e}")
         finally:
@@ -247,7 +231,7 @@ def setup_acoular_processing() -> Optional[Dict[str, Any]]:
         st = SteeringVector(grid=grid, mics=mg, env=env)
         
         print("Acoular processing pipeline initialized")
-        print(f"Using {NUM_MICS} microphones with sample rate {SAMPLE_RATE} Hz")
+        print(f"Using {NUM_MICS} microphones")
         
         return {
             'mic_geometry': mg,
@@ -263,32 +247,23 @@ def setup_acoular_processing() -> Optional[Dict[str, Any]]:
         return None
 
 def main():
-    """Main function to demonstrate the audio processing pipeline."""
+    """Main function to demonstrate the mean value processing pipeline."""
     # Set up Acoular processing
     acoular_ctx = setup_acoular_processing()
     if not acoular_ctx:
         return
     
-    # Set up the audio receiver
+    # Set up the mean value receiver
     receiver = TeensyAudioReceiver()
-    
-    # Audio buffer for 1 second of data
-    buffer_duration = 1.0  # seconds
-    samples_needed = int(SAMPLE_RATE * buffer_duration)
-    audio_buffer = np.zeros((NUM_MICS, samples_needed), dtype=np.float32)
-    buffer_pos = 0
     
     # Results queue for visualization
     result_queue = Queue()
-    
-    # Lock for thread-safe buffer access
-    buffer_lock = threading.Lock()
     
     # Flag to control the processing thread
     processing = True
     
     # Create output directory if it doesn't exist
-    output_dir = 'sound_maps'
+    output_dir = 'mean_values'
     os.makedirs(output_dir, exist_ok=True)
     
     # Counter for saved images
@@ -296,93 +271,11 @@ def main():
     max_images = 100  # Maximum number of images to keep
     
     def process_audio_packet(packet: AudioPacket):
-        nonlocal buffer_pos
-        
-        with buffer_lock:
-            # Calculate how many samples we can add to the buffer
-            remaining_space = samples_needed - buffer_pos
-            add_samples = min(packet.data.shape[1], remaining_space)
-            
-            if add_samples > 0:
-                # Add the new samples to the buffer
-                audio_buffer[:, buffer_pos:buffer_pos + add_samples] = \
-                    packet.data[:, :add_samples]
-                buffer_pos += add_samples
-                
-                # If buffer is full, process it
-                if buffer_pos >= samples_needed:
-                    # Make a copy of the buffer for processing
-                    process_buffer = audio_buffer.copy()
-                    buffer_pos = 0  # Reset buffer position
-                    
-                    # Start a new thread for beamforming to avoid blocking
-                    threading.Thread(
-                        target=run_beamforming,
-                        args=(process_buffer, result_queue, acoular_ctx)
-                    ).start()
-    
-    def run_beamforming(audio_data, result_queue, ac_ctx):
-        try:
-            # Create a TimeSamples object with our data
-            from acoular import TimeSamples, MicGeom, RectGrid, \
-                               SteeringVector, BeamformerBase, \
-                               BeamformerFunctional, FiltFiltOctave, \
-                               PowerSpectra, Environment, L_p
-            
-            # Create a TimeSamples-like object with our data
-            class AudioBuffer(TimeSamples):
-                def __init__(self, data, sample_rate):
-                    self.data = data
-                    self.sample_rate = sample_rate
-                    self.numsamples_fh = data.shape[1]
-                    self.numchannels = data.shape[0]
-                
-                def data_upto(self, samples):
-                    return self.data[:, :samples]
-                
-                def _get_data(self, num=0):
-                    return self.data
-            
-            # Create time data object
-            ts = AudioBuffer(audio_data, SAMPLE_RATE)
-            
-            # Configure processing chain
-            ps = PowerSpectra(
-                time_data=ts,
-                block_size=128,  # FFT size
-                window='Hanning'
-            )
-            
-            # Create a grid for the beamforming map
-            grid = ac_ctx['grid']
-            
-            # Configure beamformer (using functional beamformer as in the example)
-            bb = BeamformerFunctional(
-                freq_data=ps,
-                grid=grid,
-                steer=ac_ctx['steering_vector'],
-                r_diag=True,
-                # Functional beamformer parameters
-                gamma=3,  # Controls the dynamic range
-                dyn_range=40.0  # Dynamic range in dB
-            )
-            
-            # Calculate the beamforming map
-            pm = bb.synthetic(8000, 1)  # 8 kHz, single frequency band
-            
-            # Get the maximum value position
-            max_idx = np.argmax(pm)
-            max_pos = grid.pos.T[max_idx]
-            
-            # Put results in the queue for visualization
-            result_queue.put({
-                'map': pm.reshape(grid.shape),
-                'max_pos': max_pos,
-                'timestamp': time.time()
-            })
-            
-        except Exception as e:
-            print(f"Error in beamforming: {e}")
+        # Put results in the queue for visualization
+        result_queue.put({
+            'means': packet.means,
+            'timestamp': packet.timestamp
+        })
     
     def update_plot():
         """Update and save the plot as an image file."""
@@ -395,62 +288,25 @@ def main():
             # Create a new figure
             plt.figure(figsize=(10, 8))
             
-            # Create a heatmap of the beamforming result
-            plt.imshow(
-                result['map'],
-                extent=[
-                    acoular_ctx['grid'].x_min,
-                    acoular_ctx['grid'].x_max,
-                    acoular_ctx['grid'].y_min,
-                    acoular_ctx['grid'].y_max
-                ],
-                origin='lower',
-                aspect='auto',
-                cmap='hot',
-                norm=mcolors.Normalize(vmin=0, vmax=1)
-            )
-            
-            # Add colorbar
-            plt.colorbar(label='Relative Power (dB)')
-            
-            # Mark the maximum position
-            plt.scatter(
-                result['max_pos'][0],
-                result['max_pos'][1],
-                c='cyan',
-                marker='x',
-                s=100,
-                linewidths=2
-            )
+            # Plot mean values
+            plt.bar(range(NUM_MICS), result['means'])
             
             # Add title and labels
-            plt.title(f'Sound Source Localization\nMax at: ({result["max_pos"][0]:.2f}, {result["max_pos"][1]:.2f}) m')
-            plt.xlabel('X Position (m)')
-            plt.ylabel('Y Position (m)')
-            
-            # Plot microphone positions
-            plt.scatter(
-                acoular_ctx['mic_geometry'].mpos[0],
-                acoular_ctx['mic_geometry'].mpos[1],
-                c='blue',
-                marker='o',
-                label='Microphones'
-            )
-            
-            plt.legend()
-            plt.tight_layout()
+            plt.title(f'Mean Values at {result["timestamp"]} ms')
+            plt.xlabel('Microphone Index')
+            plt.ylabel('Mean Value')
             
             # Save the figure
-            output_file = os.path.join(output_dir, f'sound_map_{image_counter % max_images:03d}.png')
+            output_file = os.path.join(output_dir, f'mean_values_{image_counter % max_images:03d}.png')
             plt.savefig(output_file, dpi=100, bbox_inches='tight')
             plt.close()
             
-            print(f"Saved sound map to {output_file}")
+            print(f"Saved mean values to {output_file}")
             image_counter += 1
             
             # Clean up old files if we've reached the maximum
             if image_counter >= max_images and image_counter % max_images == 0:
-                old_file = os.path.join(output_dir, f'sound_map_{(image_counter - max_images) % max_images:03d}.png')
+                old_file = os.path.join(output_dir, f'mean_values_{(image_counter - max_images) % max_images:03d}.png')
                 if os.path.exists(old_file):
                     os.remove(old_file)
             
@@ -460,10 +316,10 @@ def main():
             plt.close('all')
     
     try:
-        # Start processing audio in the background
+        # Start processing mean values in the background
         receiver.process_in_background(process_audio_packet)
         
-        print("Processing audio. Press Ctrl+C to stop...")
+        print("Processing mean values. Press Ctrl+C to stop...")
         
         # Main loop
         while processing:
