@@ -94,24 +94,62 @@ class TeensyAudioReceiver:
         except serial.SerialException as e:
             print(f"Error opening serial port {self.port}: {e}")
             return False
+            
+    def disconnect(self):
+        """Close the serial connection if it's open."""
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+            print("Disconnected from serial port")
     
     def read_packet(self) -> Optional[AudioPacket]:
         """Read and parse a single line of mean values from the Teensy."""
-        if self.serial_conn.in_waiting > 0:
-            # Read a line from serial
+        if not self.serial_conn or not self.serial_conn.is_open:
+            return None
+            
+        try:
+            # Read a line from serial with a timeout
             line = self.serial_conn.readline().decode('ascii', errors='ignore').strip()
             if not line:
                 return None
                 
+            # Skip empty lines or lines that don't contain a comma
+            if ',' not in line:
+                return None
+                
+            # Print raw line for debugging (uncomment if needed)
+            # print(f"Raw line: {line}")
+                
             try:
-                # Split the line into values
-                values = line.split(',')
+                # Split the line into values and clean each value
+                values = [v.strip() for v in line.split(',')]
+                
+                # Validate we have the right number of values
                 if len(values) != NUM_MICS + 1:  # timestamp + NUM_MICS values
-                    print(f"Unexpected number of values: {len(values)} (expected {NUM_MICS + 1})")
+                    # Try to recover by taking only the first NUM_MICS+1 values
+                    if len(values) > NUM_MICS + 1:
+                        values = values[:NUM_MICS + 1]
+                    else:
+                        print(f"Incomplete data: expected {NUM_MICS + 1} values, got {len(values)}")
+                        return None
+                
+                # Parse timestamp (first value)
+                try:
+                    timestamp = int(float(values[0]))
+                except (ValueError, IndexError):
+                    print(f"Invalid timestamp: {values[0] if values else 'None'}")
                     return None
-                    
-                timestamp = int(values[0])
-                means = np.array([float(v) for v in values[1:]], dtype=np.float32)
+                
+                # Parse mean values (remaining values)
+                means = []
+                for i, val in enumerate(values[1:NUM_MICS + 1], 1):
+                    try:
+                        means.append(float(val))
+                    except (ValueError, IndexError):
+                        print(f"Invalid value for mic {i}: {val}")
+                        return None
+                
+                # Convert to numpy array
+                means = np.array(means, dtype=np.float32)
                 
                 # Update statistics
                 self.packet_count += 1
@@ -124,12 +162,17 @@ class TeensyAudioReceiver:
                     print(f"Received {self.packet_count} packets ({rate:.1f} KB/s)")
                     self.last_print_time = current_time
                     self.bytes_received = 0
-                    
+                
                 return AudioPacket(timestamp, means)
                 
             except Exception as e:
-                print(f"Error parsing line '{line}': {e}")
+                print(f"Error parsing line: {e}")
                 return None
+                
+        except (serial.SerialException, OSError) as e:
+            print(f"Serial communication error: {e}")
+            return None
+            
         return None
     
     def process_in_background(self, callback):

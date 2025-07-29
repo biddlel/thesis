@@ -155,20 +155,31 @@ void send_audio_buffer() {
         mean_buffer[mic] = (float)sum / BUFFER_SIZE;
     }
     
-    // Print timestamp first
-    Serial1.print(millis());
+    // Get current timestamp
+    unsigned long current_time = millis();
     
-    // Print mean values with 6 decimal places
+    // Send to Serial1 (UART)
+    Serial1.print(current_time);
     for (int i = 0; i < NUM_MICS; i++) {
         Serial1.print(',');
         Serial1.print(mean_buffer[i], 6);
     }
-    Serial1.println();  // End of line
+    Serial1.println();
+    
+    // Send to Serial (USB)
+    Serial.print("MEANS,");
+    Serial.print(current_time);
+    for (int i = 0; i < NUM_MICS; i++) {
+        Serial.print(",");
+        Serial.print(mean_buffer[i], 6);
+    }
+    Serial.println();
     
     // Debug output
     static unsigned long last_print = 0;
-    if (millis() - last_print > 1000) {
-        Serial.print("Sent mean values\n");
-        last_print = millis();
+    if (current_time - last_print > 1000) {
+        Serial.print("Debug: Sent mean values at ");
+        Serial.println(current_time);
+        last_print = current_time;
     }
 }
