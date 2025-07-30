@@ -12,12 +12,17 @@
 #define HISTORY_BLOCKS      (FFT_SIZE / BLOCK_SAMPLES)
 #define DEG2RAD             0.017453292519943295f
 #define MODE_TIME_SEC       1 // in seconds
+#define DOA_OFFSET_DEG      131.0f
+#define MIN_FREQ_HZ         800.0f 
+#define TOP_MODES           5
+
 
 // Corner microphones on a square in XY‑plane, Z=0 (counter‑clockwise)
 // 0: Bottom‑Left  (‑X, ‑Y)
 // 1: Bottom‑Right (+X, ‑Y)
 // 2: Top‑Right    (+X, +Y)
 // 3: Top‑Left     (‑X, +Y)
+
 static const float micPos[NUM_MICS][3] = {
   { 96.41, 90.05, 0.0}, // Mic 1 (top-right)
   {-98.08, 89.86, 0.0}, // Mic 2 (top-left)
