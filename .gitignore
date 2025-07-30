@@ -3,6 +3,7 @@
 *.torchscript
 pi/camera-test/env/*
 pi/camera-test/yolo11n_ncnn_model/*
+*.png
 *log.txt
 .DS_Store
 
