@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-doa_yolo_picam.py
-────────────────────────────────────────────────────────────────
-• Reads 'Angle: XXX, Count: YYY' from a Teensy over USB-Serial
-• Captures a still with Picamera2, undistorts using calibration
-  from cm3wide_calib.npz, and runs YOLO (Ultralytics).
-• Correlates the acoustic DOA with detected objects.
-
-Dependencies:
-    pip3 install pyserial ultralytics opencv-python picamera2
-"""
-
-# ─── Imports ──────────────────────────────────────────────────
 import re, sys, time, os, termios, tty, select
 from pathlib import Path
 import numpy as np
@@ -21,7 +7,6 @@ from picamera2 import Picamera2
 from ultralytics import YOLO
 from math import atan, degrees, radians, tan
 
-# ─── USER CONFIG ────────────────────────────────────────────
 SERIAL_PORT       = "/dev/ttyAMA0"
 BAUD_RATE         = 115200
 
@@ -42,11 +27,9 @@ SAVE_DIR          = Path("captures")
 
 WEDGE_ALPHA_MAIN  = 0.30         # primary wedge opacity
 WEDGE_ALPHA_OTH   = 0.15         # other wedges opacity
-# ────────────────────────────────────────────────────────────
 
 SAVE_DIR.mkdir(exist_ok=True)
 
-# --- helper maths -------------------------------------------------
 def pixel_to_angle(x_px: float, img_w: int) -> float:
     cx = img_w / 2
     fx = cx / tan(radians(HFOV_DEG / 2))
@@ -61,7 +44,7 @@ def add_wedge(img, ang_deg, tol, colour, alpha):
                 colour, thickness=-1)
     return cv2.addWeighted(overlay, alpha, img, 1-alpha, 0)
 
-# --- initialise camera, model, serial ------------------------------
+
 picam = Picamera2()
 picam.configure(picam.create_still_configuration({"size": CAP_SIZE}))
 picam.start(); time.sleep(0.3)
@@ -70,7 +53,7 @@ model = YOLO(MODEL_PATH, task="detect")
 ser   = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 pat_modes = re.compile(r"Angles:\s+(.*)")
 
-# user-quit (q ↵) preparation
+
 fd = sys.stdin.fileno()
 old_tty = termios.tcgetattr(fd); tty.setcbreak(fd)
 
@@ -86,7 +69,7 @@ try:
         if not m:
             continue
 
-        # ---------- parse & filter modes ----------
+        # filters
         modes = []
         for tok in m.group(1).split():
             if '°:' in tok:
@@ -105,14 +88,14 @@ try:
         primary_ang, primary_cnt = modes[0]
         print(f"Primary DOA {primary_ang}°  ({primary_cnt} hits)")
 
-        # ---------- capture frame ----------
+        # frame capture
         frame = picam.capture_array("main")
         if ROTATE180:
             frame = cv2.rotate(frame, cv2.ROTATE_180)
         if SWAP_RB:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        # ---------- YOLO ----------
+        # yolo
         res = model(frame, task="detect", verbose=False)[0]
         if len(res.boxes):
             best, best_err = None, 1e9
