@@ -4,6 +4,7 @@
 pi/camera-test/env/*
 pi/camera-test/yolo11n_ncnn_model/*
 *.png
+*match.jpg
 *log.txt
 .DS_Store
 
