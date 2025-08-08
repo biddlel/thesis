@@ -1,9 +1,5 @@
 #pragma once
 
-// ──────────────────────────────────────────────────────────────
-// Constants
-// ──────────────────────────────────────────────────────────────
-
 #define SPEED_OF_SOUND      343.0f      // m/s @ 20°C
 #define SAMPLE_RATE_HZ      44100
 #define FFT_SIZE            1024        // AudioAnalyzeFFT1024
@@ -15,13 +11,6 @@
 #define DOA_OFFSET_DEG      0.0f
 #define MIN_FREQ_HZ         800.0f 
 #define TOP_MODES           5
-
-
-// Corner microphones on a square in XY‑plane, Z=0 (counter‑clockwise)
-// 0: Bottom‑Left  (‑X, ‑Y)
-// 1: Bottom‑Right (+X, ‑Y)
-// 2: Top‑Right    (+X, +Y)
-// 3: Top‑Left     (‑X, +Y)
 
 static const float micPos[NUM_MICS][3] = {
   { 96.41, 90.05, 0.0}, // Mic 1 (top-right)
