@@ -46,6 +46,7 @@ void loop() {
   if (doa.available()) {
     float az = doa.read();                       // 0-359°
     int bin  = int(az + 0.5f) % 360;
+    // bin = int(bin + DOA_OFFSET_DEG) % 360; 
     hist[bin]++;
 
     // end-of-window?

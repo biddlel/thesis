@@ -95,7 +95,7 @@ float DOAMusic::scanAzimuth(){
             EnEnH[r*NUM_MICS+c]=s;
         }
 
-    for(int ang=0; ang<360; ++ang){
+    for(int ang=0; ang<360; ang+= 5){
         float th=ang*DEG2RAD;
         float sv[NUM_MICS];
         for(int m=0;m<NUM_MICS;++m){

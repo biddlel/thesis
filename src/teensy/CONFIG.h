@@ -12,7 +12,7 @@
 #define HISTORY_BLOCKS      (FFT_SIZE / BLOCK_SAMPLES)
 #define DEG2RAD             0.017453292519943295f
 #define MODE_TIME_SEC       1 // in seconds
-#define DOA_OFFSET_DEG      131.0f
+#define DOA_OFFSET_DEG      0.0f
 #define MIN_FREQ_HZ         800.0f 
 #define TOP_MODES           5
 
