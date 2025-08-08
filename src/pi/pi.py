@@ -12,7 +12,7 @@ Dependencies:
 """
 
 # ─── Imports ──────────────────────────────────────────────────
-import re, sys, time, os
+import re, sys, time, os, termios, tty, select
 from pathlib import Path
 import numpy as np
 import cv2
@@ -28,14 +28,16 @@ BAUD_RATE         = 115200
 CAP_SIZE          = (1280, 720)  # (width, height)
 HFOV_DEG          = 102.0        # Cam Module 3 Wide
 
-MIN_MODE_COUNT    = 10           # Ignore DOA bins with fewer hits
+MIN_MODE_COUNT    = 7           # Ignore DOA bins with fewer hits
 TOP_DRAW          = 4            # Draw up to this many wedges
-ANGLE_TOLERANCE   = 10.0         # ±° for DOA↔object match
+ANGLE_TOLERANCE   = 20.0         # ±° for DOA↔object match
+
+ANGLE_OFFSET      = 270
 
 ROTATE180         = True         # Flip image if cam is upside-down
 SWAP_RB           = True         # Picamera2 gives RGB; cv2 wants BGR
 
-MODEL_PATH        = "models/yolo11s.onnx"  # or yolov11.pt
+MODEL_PATH        = "models/yolo11s_ncnn_model"  # or yolov11.pt
 SAVE_DIR          = Path("captures")
 
 WEDGE_ALPHA_MAIN  = 0.30         # primary wedge opacity
@@ -64,9 +66,9 @@ picam = Picamera2()
 picam.configure(picam.create_still_configuration({"size": CAP_SIZE}))
 picam.start(); time.sleep(0.3)
 
-model = YOLO(MODEL_PATH)
+model = YOLO(MODEL_PATH, task="detect")
 ser   = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-pat_modes = re.compile(r"MODES\s+(.*)")
+pat_modes = re.compile(r"Angles:\s+(.*)")
 
 # user-quit (q ↵) preparation
 fd = sys.stdin.fileno()
@@ -92,7 +94,8 @@ try:
                     ang_s, cnt_s = tok.split('°:')
                     cnt = int(cnt_s)
                     if cnt >= MIN_MODE_COUNT:
-                        modes.append((int(ang_s) % 360, cnt))
+                        angle = (int(ang_s) + ANGLE_OFFSET) % 360
+                        modes.append((angle, cnt))
                 except ValueError:
                     pass
 
@@ -109,14 +112,8 @@ try:
         if SWAP_RB:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        # ---------- draw wedges ----------
-        for i, (ang, _) in enumerate(modes[:TOP_DRAW]):
-            alpha = WEDGE_ALPHA_MAIN if i == 0 else WEDGE_ALPHA_OTH
-            colour = (0,255,0) if i == 0 else (0,128,0)
-            frame = add_wedge(frame, ang, ANGLE_TOLERANCE, colour, alpha)
-
         # ---------- YOLO ----------
-        res = model(frame, verbose=False)[0]
+        res = model(frame, task="detect", verbose=False)[0]
         if len(res.boxes):
             best, best_err = None, 1e9
             h, w = frame.shape[:2]
@@ -138,13 +135,19 @@ try:
             cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
             cv2.putText(frame,f"{model.names[cls]} {conf:.2f}",
                         (x1,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,0),2)
-            cv2.putText(frame,f"Match {az_cam:.1f}°",(10,frame.shape[0]-10),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+            # cv2.putText(frame,f"Match {az_cam:.1f}°",(10,frame.shape[0]-10),
+            #             cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
             out = SAVE_DIR / f"{ts}_match.jpg"
         else:
-            cv2.putText(frame,f"No match ±{ANGLE_TOLERANCE}°",
+            cv2.putText(frame,f"No match {primary_ang:.1f}°",
                         (10,frame.shape[0]-10),
                         cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
+
+            for i, (ang, _) in enumerate(modes[:TOP_DRAW]):
+                alpha = WEDGE_ALPHA_MAIN if i == 0 else WEDGE_ALPHA_OTH
+                colour = (0,0,255) if i == 0 else (0,0,128)
+                frame = add_wedge(frame, ang, ANGLE_TOLERANCE, colour, alpha)
+
             out = SAVE_DIR / f"{ts}_nomatch.jpg"
 
         cv2.imwrite(str(out), frame)
